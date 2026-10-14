@@ -276,5 +276,74 @@ await test('识别失败：显示上游给的原因，且不留下过期下拉',
   } finally { globalThis.fetch = originalFetch; }
 });
 
+await test('尺寸下拉：覆盖 1K / 2K / 4K 与 16:9、16:10、竖屏、电影画幅', () => {
+  const { render } = mountClient({ 0: { size: '1024x1024' } });
+  const tree = render();
+  // 只有尺寸下拉用了分组（张数是扁平列表）
+  const sizeSelect = tree.find(n => Array.isArray(n.props?.options)
+    && n.props.options.some(o => Array.isArray(o.options)));
+  assert.ok(sizeSelect, '尺寸应当是分组下拉');
+  assert.equal(sizeSelect.props.value, '1024x1024');
+
+  const groups = sizeSelect.props.options.filter(o => Array.isArray(o.options));
+  const groupLabels = groups.map(g => g.group);
+  for (const prefix of ['1K', '2K', '4K', 'OpenAI']) {
+    assert.ok(groupLabels.some(l => l.startsWith(prefix)), `应有 ${prefix} 分组，实际：${groupLabels.join(' / ')}`);
+  }
+
+  const values = sizeSelect.props.options.flatMap(o => (Array.isArray(o.options) ? o.options.map(x => x.value) : [o.value]));
+  for (const [value, why] of [
+    ['1024x1024', '1K 1:1'],
+    ['1280x720', '1K 16:9'],
+    ['1280x800', '1K 16:10'],
+    ['1344x576', '1K 电影 21:9'],
+    ['768x1024', '1K 竖屏 3:4'],
+    ['720x1280', '1K 竖屏 9:16'],
+    ['1920x1200', '2K 16:10'],
+    ['2560x1080', '2K 电影 21:9'],
+    ['1080x1920', '2K 竖屏 9:16'],
+    ['4096x4096', '4K 1:1'],
+    ['3840x2160', '4K 16:9'],
+    ['3200x1440', '20:9 超宽'],
+    ['1792x1024', 'OpenAI 宽'],
+    ['512x512', '小图'],
+  ]) {
+    assert.ok(values.includes(value), `预设应包含 ${value}（${why}）`);
+  }
+
+  const allLabels = groups.flatMap(g => g.options.map(o => o.label)).join(' ');
+  for (const text of ['16:9', '16:10', '21:9 电影', '竖屏']) {
+    assert.ok(allLabels.includes(text), `标签里应能看出比例：${text}`);
+  }
+  // 第一项仍然是"不发送 size"
+  assert.equal(sizeSelect.props.options[0].value, '');
+});
+
+await test('尺寸下拉：预设外的当前值会补成一项，避免下拉显示空白', () => {
+  const { state, render } = mountClient({ 0: { size: '3000x2000' } });
+  const findSize = (t) => t.find(n => Array.isArray(n.props?.options) && n.props.options.some(o => Array.isArray(o.options)));
+
+  let select = findSize(render());
+  assert.equal(select.props.value, '3000x2000', '下拉当前值应保持配置值');
+  const current = select.props.options.find(o => o.value === '3000x2000');
+  assert.ok(current, '预设外的当前值必须补成一项，否则下拉显示空白、用户会以为配置丢了');
+  assert.match(current.label, /当前值/);
+
+  // 改选预设值 → 写进配置
+  select.props.onChange('1920x1080');
+  assert.equal(state.cell(0).size, '1920x1080');
+  select = findSize(render());
+  assert.equal(select.props.value, '1920x1080');
+  assert.equal(select.props.options.some(o => String(o.label).includes('当前值')), false, '已是预设值就不该再补项');
+});
+
+await test('尺寸下拉：空值与预设值都不触发补项', () => {
+  for (const size of ['', '1024x1024']) {
+    const { render } = mountClient({ 0: { size } });
+    const select = render().find(n => Array.isArray(n.props?.options) && n.props.options.some(o => Array.isArray(o.options)));
+    assert.equal(select.props.options.some(o => String(o.label).includes('当前值')), false, `size=${JSON.stringify(size)} 不该补项`);
+  }
+});
+
 console.log(failures ? `\n${failures} 个用例失败` : '\n全部通过');
 if (failures) process.exit(1);

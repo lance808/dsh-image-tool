@@ -81,7 +81,19 @@ window.__ModuleLoader__.load({
       })
     }
 
+    /**
+     * 下拉框。`options` 支持两种形状：
+     *   { value, label }                       —— 普通项
+     *   { group, options: [{ value, label }] } —— 分组项，渲染成 <optgroup>
+     *
+     * 尺寸预设必须分组：1K/2K/4K 加起来三十多项，扁平列表找起来很痛苦，
+     * 而分组标题能让扫读快得多。
+     */
     function Select({ value, onChange, options, width = '100%' }) {
+      const items = options.map((option, index) => (Array.isArray(option.options)
+        ? h('optgroup', { key: `group-${index}`, label: option.group },
+            option.options.map(item => h('option', { key: item.value, value: item.value }, item.label)))
+        : h('option', { key: option.value === '' ? `__blank-${index}` : option.value, value: option.value }, option.label)))
       return h('select', {
         value: value ?? '',
         onChange: event => onChange(event.target.value),
@@ -97,7 +109,7 @@ window.__ModuleLoader__.load({
           outline: 'none',
           fontFamily: 'inherit',
         },
-      }, options.map(option => h('option', { key: option.value, value: option.value }, option.label)))
+      }, items)
     }
 
     function Button({ children, onClick, disabled, tone = 'default' }) {
@@ -139,14 +151,97 @@ window.__ModuleLoader__.load({
 
     // ── 设置页 ────────────────────────────────────────────────────────────────
 
+    /**
+     * 尺寸预设，按分辨率档位分组。
+     *
+     * 标签只写"比例 · 像素"（不再重复档位），因为分组标题已经写明档位。
+     * 比例覆盖：1:1 / 4:3 / 3:2 / 16:10 / 16:9 / 21:9 电影，以及各自的竖屏方向
+     * （3:4 / 2:3 / 10:16 / 9:16 / 9:21），另附 OpenAI 官方支持的几个固定尺寸。
+     *
+     * ⚠️ 这只是**省手打**的便利列表，不是能力边界：不同上游接受的尺寸集合差别很大
+     * （OpenAI 只认几个固定值，自建 / 中转站往往任意尺寸）。需要特殊尺寸时，在对话里
+     * 直接让模型传 `size` 参数即可（例如 3200x1440），那条路不受这个下拉限制。
+     */
+    const SIZE_GROUPS = [
+      {
+        group: '1K（约 100 万像素）',
+        sizes: [
+          ['1024x1024', '1:1 · 1024×1024'],
+          ['1024x768', '4:3 · 1024×768'],
+          ['1152x768', '3:2 · 1152×768'],
+          ['1280x800', '16:10 · 1280×800'],
+          ['1280x720', '16:9 · 1280×720'],
+          ['1344x576', '21:9 电影 · 1344×576'],
+          ['768x1024', '3:4 竖屏 · 768×1024'],
+          ['768x1152', '2:3 竖屏 · 768×1152'],
+          ['800x1280', '10:16 竖屏 · 800×1280'],
+          ['720x1280', '9:16 竖屏 · 720×1280'],
+          ['576x1344', '9:21 竖屏电影 · 576×1344'],
+        ],
+      },
+      {
+        group: '2K（约 200–400 万像素）',
+        sizes: [
+          ['2048x2048', '1:1 · 2048×2048'],
+          ['2048x1536', '4:3 · 2048×1536'],
+          ['2160x1440', '3:2 · 2160×1440'],
+          ['1920x1200', '16:10 · 1920×1200'],
+          ['1920x1080', '16:9 · 1920×1080'],
+          ['2560x1080', '21:9 电影 · 2560×1080'],
+          ['1536x2048', '3:4 竖屏 · 1536×2048'],
+          ['1440x2160', '2:3 竖屏 · 1440×2160'],
+          ['1200x1920', '10:16 竖屏 · 1200×1920'],
+          ['1080x1920', '9:16 竖屏 · 1080×1920'],
+          ['1080x2560', '9:21 竖屏电影 · 1080×2560'],
+        ],
+      },
+      {
+        group: '4K（约 500 万像素以上，上游可能拒绝）',
+        sizes: [
+          ['4096x4096', '1:1 · 4096×4096'],
+          ['3840x2160', '16:9 · 3840×2160'],
+          ['3840x2400', '16:10 · 3840×2400'],
+          ['3440x1440', '21:9 电影 · 3440×1440'],
+          ['3200x1440', '20:9 超宽 · 3200×1440'],
+          ['2160x3840', '9:16 竖屏 · 2160×3840'],
+        ],
+      },
+      {
+        group: 'OpenAI 官方固定尺寸',
+        sizes: [
+          ['1536x1024', '横 · 1536×1024'],
+          ['1024x1536', '竖 · 1024×1536'],
+          ['1792x1024', '宽 · 1792×1024'],
+          ['1024x1792', '高 · 1024×1792'],
+          ['512x512', '小图 · 512×512'],
+        ],
+      },
+    ]
+
     const SIZE_PRESETS = [
       { value: '', label: '（使用上游默认）' },
-      { value: '512x512', label: '512 × 512' },
-      { value: '1024x1024', label: '1024 × 1024' },
-      { value: '1024x1536', label: '1024 × 1536（竖）' },
-      { value: '1536x1024', label: '1536 × 1024（横）' },
-      { value: '1792x1024', label: '1792 × 1024（宽）' },
+      ...SIZE_GROUPS.map(g => ({ group: g.group, options: g.sizes.map(([value, label]) => ({ value, label })) })),
     ]
+
+    /** 预设里出现过的全部尺寸值，用来判断"当前值是否需要额外补一项"。 */
+    const PRESET_SIZE_VALUES = new Set(SIZE_GROUPS.flatMap(g => g.sizes.map(([value]) => value)))
+
+    /**
+     * 组装尺寸下拉的选项。
+     *
+     * 当前值是**手填的特殊尺寸**时（例如之前用 CLI 写进去的 3200x1440），必须把它
+     * 补成一项显示出来 —— 否则下拉会因为没有匹配项而显示空白，用户既看不到自己
+     * 设了什么，也容易误以为配置丢了。
+     */
+    function sizeOptionsFor(current) {
+      const size = String(current ?? '')
+      if (size === '' || PRESET_SIZE_VALUES.has(size)) return SIZE_PRESETS
+      return [
+        { value: '', label: '（使用上游默认）' },
+        { value: size, label: `${size}（当前值，不在预设内）` },
+        ...SIZE_GROUPS.map(g => ({ group: g.group, options: g.sizes.map(([value, label]) => ({ value, label })) })),
+      ]
+    }
 
     function SettingsPage() {
       const [config, setConfig] = useState(null)
@@ -330,11 +425,11 @@ window.__ModuleLoader__.load({
         ),
 
         h(Card, { title: '默认出图参数', subtitle: '模型调用工具时可以不传这些，就会用这里的默认值。' },
-          h(Row, { label: '尺寸' },
+          h(Row, { label: '尺寸', hint: '需要特殊尺寸时，在对话里让模型传 size 参数（例如「用 3200x1440 画」）' },
             h(Select, {
               value: config.size,
               onChange: value => set('size', value),
-              options: SIZE_PRESETS,
+              options: sizeOptionsFor(config.size),
             }),
           ),
           h(Row, { label: '张数' },
