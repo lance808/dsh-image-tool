@@ -1,0 +1,56 @@
+{
+  "name": "dsh-image-tool",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness 生图工具插件：把任意 OpenAI 兼容的生图服务接成平台工具，模型在对话里直接生图，图片以平台原生 image 块输出。生图 API 与对话模型 API 完全独立，可配置调用前确认。",
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "image-generation",
+    "text-to-image",
+    "tool"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "scripts": {
+    "test": "node scripts/test-generate.mjs && node scripts/test-plugin.mjs && node scripts/test-client.mjs && node scripts/test-save.mjs",
+    "test:generate": "node scripts/test-generate.mjs",
+    "test:plugin": "node scripts/test-plugin.mjs",
+    "test:client": "node scripts/test-client.mjs",
+    "mock:api": "node scripts/mock-image-api.mjs",
+    "test:mock": "node scripts/test-mock-api.mjs",
+    "install:profile": "node scripts/install-into-profile.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": []
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2"
+  }
+}

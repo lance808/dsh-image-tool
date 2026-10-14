@@ -1,0 +1,31 @@
+# 依赖与锁文件
+node_modules/
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
+
+# 日志
+*.log
+npm-debug.log*
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# ── 私有内容：绝不提交 ────────────────────────────────────────────────────────
+# 内部交接文档（含本机路径、用户名、服务商与调试记录）
+HANDOVER.md
+# 个人生成的图片成品
+_preview/
+generated-images/
+
+# ── 凭据：绝不提交 ───────────────────────────────────────────────────────────
+# 本插件的密钥配置在 profile 的 cordis.patch.yml 里（该文件不在本仓库内）。
+# 下面这些是通用的凭据兜底，防止误加文件时泄露。
+.env
+.env.*
+*.key
+*.pem
+*.p12
+credentials.json
+.credentials.yaml

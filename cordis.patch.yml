@@ -1,0 +1,16 @@
+# dsh-image-tool bundle patch.
+#
+# 一条 insert 把 host 半身挂进 profile。
+#
+# ⚠️ entry 的 **id 必须是 `image-tool`**（= settings 命名空间名），不是包名
+# `dsh-image-tool`。DSH 0.2.0 起 settings 命名空间完全由 loader entry 的 id 推导
+# （dsh-settings 的 `configEditor.entries().find(row => row.options.id === ns)`），
+# 写成包名会让 `settings.update({ns:'image-tool'})` 永远抛
+# `No configurable plugin entry "image-tool"`，于是"设置里填 API"这条路直接断掉。
+#
+# config 留空：所有可配置项都由 index.js 导出的 `Config` schema 声明默认值，
+# 这里不重复一遍（两处默认值会漂移）。
+- insert:
+    - id: image-tool
+      name: dsh-image-tool
+      config: {}
