@@ -706,5 +706,63 @@ await test('保存路径：留空保持默认，相对和绝对目录均按配�
   } finally { globalThis.fetch = originalFetch; await fsp.rm(dir, { recursive: true, force: true }); }
 });
 
+// ── 识别上游模型（设置页的「识别上游模型」按钮） ─────────────────────────────
+
+await test('/models：缺鉴权服务时拒绝，绝不打上游', async () => {
+  const { registerImageRoutes } = await import('../lib/routes.js');
+  let route;
+  let called = 0;
+  registerImageRoutes({ register(r) { route = r; return () => {}; } }, {
+    readConfig: () => ({}),
+    listModels: async () => { called += 1; return { endpoint: 'x', models: [] }; },
+  });
+  const res = fakeRes();
+  await route.handler(fakeReq('GET', '/api/image-tool/models'), res);
+  assert.equal(res.out.status, 403);
+  assert.equal(called, 0, '没有鉴权就不能替你打上游');
+});
+
+await test('GET /models：通过真实接线调用上游，回传排序后的模型列表', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    assert.equal(url, 'https://x.example.com/v1/models');
+    assert.equal(init.method, 'GET');
+    assert.equal(init.headers.authorization, 'Bearer secret-key');
+    return new Response(JSON.stringify({ data: [{ id: 'z-model' }, { id: 'a-model' }] }), { status: 200 });
+  };
+  try {
+    const ctx = makeCtx({ config: { apiUrl: 'https://x.example.com/v1', apiKey: 'secret-key' } });
+    apply(ctx, {});
+    const out = await callRoute(ctx, 'GET', '/models');
+    assert.equal(out.status, 200);
+    assert.deepEqual(out.body.models, ['a-model', 'z-model']);
+    assert.equal(out.body.count, 2);
+    assert.equal(out.body.endpoint, 'https://x.example.com/v1/models');
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+await test('GET /models：配置不全时回可读原因而不是 500，且不外泄密钥', async () => {
+  const ctx = makeCtx({ config: { apiUrl: '', apiKey: 'sk-should-not-leak-1234' } });
+  apply(ctx, {});
+  const out = await callRoute(ctx, 'GET', '/models');
+  assert.equal(out.status, 400);
+  assert.match(out.body.error, /未配置生图接口地址/);
+  assert.equal(JSON.stringify(out.body).includes('sk-should-not-leak'), false, '错误信息里不能带出密钥');
+});
+
+await test('GET /models：不支持查询的 composition 回 501，而不是假装成功', async () => {
+  const { registerImageRoutes } = await import('../lib/routes.js');
+  let route;
+  registerImageRoutes({ register(r) { route = r; return () => {}; } }, {
+    readConfig: () => ({ apiUrl: 'https://x.example.com/v1', apiKey: 'k' }),
+    // 有鉴权、但没有 listModels —— 这才是"composition 不支持查询"的真实形态。
+    // （没有 connection 会先撞上 403，那是另一条用例专门验的优先级。）
+    connection: { requestRejection: () => undefined },
+  });
+  const res = fakeRes();
+  await route.handler(fakeReq('GET', '/api/image-tool/models'), res);
+  assert.equal(res.out.status, 501);
+});
+
 console.log(failures ? `\n${failures} 个用例失败` : '\n全部通过');
 if (failures) process.exit(1);

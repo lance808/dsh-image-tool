@@ -16,7 +16,10 @@ import {
   generationsEndpoint,
   generateImages,
   isPrivateHost,
+  listModels,
+  modelsEndpoint,
   normalizeApiUrl,
+  parseModelList,
   sniffMediaType,
 } from '../lib/generate.js';
 
@@ -222,6 +225,100 @@ await test('generateImages：端到端（假上游 + 假附件），并把附件
   assert.match(saved[0].name, /\.png$/);
   assert.match(saved[1].name, /\.jpg$/);
   assert.equal(result.images[0].ref.attachmentId, 'att-1');
+});
+
+// ── 上游模型列表（设置页的「识别上游模型」） ─────────────────────────────────
+
+await test('modelsEndpoint：基址 / 生图端点 / 模型端点三种写法都归一到 /models', () => {
+  assert.equal(modelsEndpoint('https://x.example.com/v1'), 'https://x.example.com/v1/models');
+  // 用户可能把地址填到具体端点上：不能拼出 /images/generations/models
+  assert.equal(modelsEndpoint('https://x.example.com/v1/images/generations'), 'https://x.example.com/v1/models');
+  assert.equal(modelsEndpoint('https://x.example.com/v1/models'), 'https://x.example.com/v1/models');
+  assert.equal(modelsEndpoint('https://x.example.com/v1/'), 'https://x.example.com/v1/models');
+  // 本机假服务同样允许（与 apiUrl 的"允许本机"策略一致）
+  assert.equal(modelsEndpoint('http://127.0.0.1:18577/v1'), 'http://127.0.0.1:18577/v1/models');
+});
+
+await test('parseModelList：兼容四种回包形态，去重并排序', () => {
+  assert.deepEqual(parseModelList({ data: [{ id: 'b' }, { id: 'a' }] }), ['a', 'b']);
+  assert.deepEqual(parseModelList({ data: ['b', 'a'] }), ['a', 'b']);
+  assert.deepEqual(parseModelList({ models: [{ name: 'z' }, { model: 'y' }] }), ['y', 'z']);
+  assert.deepEqual(parseModelList(['only']), ['only']);
+  // 去重：上游经常把同一个模型列两次
+  assert.deepEqual(parseModelList({ data: [{ id: 'a' }, { id: 'a' }] }), ['a']);
+  // 认不出来的形状回落空列表，而不是抛错（由 listModels 统一给出可读原因）
+  assert.deepEqual(parseModelList(null), []);
+  assert.deepEqual(parseModelList({ object: 'list' }), []);
+  assert.deepEqual(parseModelList({ data: [{}] }), []);
+});
+
+await test('listModels：GET /models，带鉴权头，返回排序后的 id', async () => {
+  const result = await listModels({
+    config: { apiUrl: 'https://x.example.com/v1', apiKey: 'secret-key' },
+    fetchImpl: async (url, init) => {
+      assert.equal(url, 'https://x.example.com/v1/models');
+      assert.equal(init.method, 'GET');
+      assert.equal(init.headers.authorization, 'Bearer secret-key');
+      return new Response(JSON.stringify({ data: [{ id: 'z-image' }, { id: 'a-image' }] }), { status: 200 });
+    },
+  });
+  assert.deepEqual(result.models, ['a-image', 'z-image']);
+  assert.equal(result.endpoint, 'https://x.example.com/v1/models');
+});
+
+await test('listModels：缺 Key 时一个字节都不发', async () => {
+  let called = false;
+  await assert.rejects(
+    () => listModels({
+      config: { apiUrl: 'https://x.example.com/v1', apiKey: '' },
+      fetchImpl: async () => { called = true; },
+    }),
+    /未配置生图 API Key/,
+  );
+  assert.equal(called, false);
+});
+
+await test('listModels：上游报错 / 空列表 / 非法 JSON 都给出可读原因', async () => {
+  const base = { apiUrl: 'https://x.example.com/v1', apiKey: 'k' };
+  await assert.rejects(
+    () => listModels({ config: base, fetchImpl: async () => new Response('unauthorized', { status: 401 }) }),
+    /HTTP 401/,
+  );
+  // 空列表要明确提到"可能没有这个端点"，否则用户会以为是 Key 填错了
+  await assert.rejects(
+    () => listModels({ config: base, fetchImpl: async () => new Response(JSON.stringify({ data: [] }), { status: 200 }) }),
+    /不提供 \/models 端点/,
+  );
+  await assert.rejects(
+    () => listModels({ config: base, fetchImpl: async () => new Response('<html>gateway</html>', { status: 200 }) }),
+    /不是合法 JSON/,
+  );
+});
+
+await test('listModels：连不上与正文挂起超时都转成可读错误', async () => {
+  await assert.rejects(
+    () => listModels({
+      config: { apiUrl: 'https://x.example.com/v1', apiKey: 'k' },
+      fetchImpl: async () => { throw new Error('ECONNREFUSED'); },
+    }),
+    /连不上模型列表接口/,
+  );
+  await assert.rejects(
+    () => listModels({
+      config: { apiUrl: 'https://x.example.com/v1', apiKey: 'k' },
+      timeoutMs: 20,
+      fetchImpl: async (_url, init) => {
+        const body = new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('{"data":['));
+            init.signal.addEventListener('abort', () => controller.error(init.signal.reason), { once: true });
+          },
+        });
+        return new Response(body, { status: 200 });
+      },
+    }),
+    /被中止或超时/,
+  );
 });
 
 console.log(failures ? `\n${failures} 个用例失败` : '\n全部通过');

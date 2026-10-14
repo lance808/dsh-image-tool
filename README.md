@@ -10,6 +10,7 @@ exposed as a native platform tool.*
 - **不引入任何私有内容块** —— 只用平台自己的 `image` 块，纯文本模型也能安全经过
 - **调用前弹窗确认**（默认开）—— 生图真实计费，不希望你不在场时被刷
 - **完整的设置页** —— DSH「设置 → 图像生成」里填接口、密钥、默认参数与保存目录
+- **一键识别上游模型** —— 设置页点「识别上游模型」即从 `{apiUrl}/models` 拉取列表并选择
 - **外部调用接口** —— `/api/image-tool/*`，不想经过模型时由别的程序直接调
 - **不依赖构建** —— 宿主半是普通 ESM，浏览器半是手写的 ModuleLoader bundle
 
@@ -76,7 +77,7 @@ node scripts/install-into-profile.mjs desktop
 
 | 分组 | 内容 |
 |---|---|
-| 接口 | 接口地址、API Key、生图模型 |
+| 接口 | 接口地址、API Key、生图模型（可点「识别上游模型」拉取列表选择） |
 | 默认出图参数 | 尺寸、张数 |
 | 图片保存 | 默认保存路径 |
 | 调用前确认 | 每次生图前向我确认 |
@@ -90,6 +91,22 @@ node scripts/install-into-profile.mjs desktop
 
 浏览器半是**手写的 ModuleLoader bundle，没有构建步骤** —— React 由外壳提供，
 本插件不带任何前端依赖。
+
+#### 识别上游模型
+
+「生图模型」右侧的 **识别上游模型** 按钮会拉取 `{apiUrl}/models`，把结果去重排序后
+列成下拉框，选中即填入输入框（**仍然要点「保存」才生效**）。
+
+几个刻意的选择：
+
+- **不自动请求**：只在点按钮时才打上游。打开设置页就自动查，等于每次进设置都替你
+  发一次你没要求的网络请求，而且会在你还没填完 Key 的时候就报错。
+- **超时 20 秒**：列表接口不该让人等几十秒；慢到这个程度就报错，让你手动填写。
+- **失败原因如实回报**：分清"Key 被拒（HTTP 401）"和"这个上游根本不提供 `/models`"，后者要明确提示手动填写。
+- **兼容多种回包形态**：`{data:[{id}]}`、`{data:["x"]}`、`{models:[...]}`、裸数组，
+  以及用 `name` / `model` 代替 `id` 的网关。
+- **识别结果不落盘**：它只是帮你把值填进输入框；配置以点「保存」写入的为准。
+- **改过接口地址或密钥后列表作废**：保存成功会清空已识别的列表，避免选到一个不属于当前上游的模型。
 
 ### 3.2 用附带的 CLI
 
@@ -121,7 +138,7 @@ node scripts/configure.mjs --clear-key     # 清除已保存的密钥
 |---|---|---|
 | `apiUrl` | `''` | 生图接口基址，如 `https://api.openai.com/v1`。**允许本机**（`http://127.0.0.1:7860` 这类本地服务是正当用法） |
 | `apiKey` | `''` | 生图服务密钥。与对话模型凭据无关 |
-| `model` | `''` | 生图模型名；留空则不发送 `model` 字段，由上游默认 |
+| `model` | `''` | 生图模型名；留空则不发送 `model` 字段，由上游默认。设置页可点「识别上游模型」从 `{apiUrl}/models` 拉取列表后选择 |
 | `size` | `''` | 默认尺寸，如 `1024x1024` |
 | `count` | `1` | 默认张数（1~8） |
 | `savePath` | `''` | 默认保存目录；留空保持当前会话的 `generated-images/`，支持绝对目录或相对会话工作目录的目录 |
@@ -200,6 +217,9 @@ GET  /api/image-tool/status
 GET  /api/image-tool/config
 POST /api/image-tool/config      { "apiUrl": "...", "apiKey": "...", "clearApiKey": false, ... }
 
+# 识别上游可用模型（设置页的「识别上游模型」按钮用的就是它）
+GET  /api/image-tool/models      → { ok, models: ["..."], endpoint, count }
+
 # 生图；includeData=1 时额外返回 base64 字节
 POST /api/image-tool/generate
      { "prompt": "一只猫", "size": "1024x1024", "count": 1 }
@@ -225,7 +245,7 @@ GET /api/image-tool/image?id=<attachmentId>&download=1   # 带 Content-Dispositi
 
 所以这些端点**不会**自动继承 `/api/*` 的鉴权。本插件显式向 `connection` 服务要判定
 （`connection.requestRejection(request)`）；拿不到 `connection` 时**不假装安全**：
-只提供只读面，写操作与生图一律 403。
+只提供只读面，配置写入、生图与**上游模型查询**一律 403。
 
 **工具路径与 HTTP 路径共用同一份 `runGenerate`**，所以协议、校验、SSRF 关卡、附件落地
 完全一致，不存在"两条路行为不同"。唯一差别是：**确认弹窗只加在工具路径上** ——
@@ -309,18 +329,20 @@ dsh-image-tool/
 │   ├── index.js                入口：Config schema / apply（step() 逐步容错）/ runGenerate
 │   │                           落盘：makeDiskSaver + cwdFromExecution + makeImageFetcher
 │   ├── generate.js             生图核心：请求构造 / 回包解析 / SSRF 关卡 / 附件落地
+│   │                           上游模型列表（listModels / modelsEndpoint）
 │   │                           （纯逻辑，不碰 ctx，可离线测）
-│   ├── routes.js               外部接口 + 鉴权 + /image 取字节
+│   ├── routes.js               外部接口 + 鉴权 + /image 取字节 + /models 识别
 │   ├── save.js                 另存：会话图片恢复 / 路径限制 / 不覆盖写入
 │   └── diag.js                 诊断日志
 ├── scripts/
 │   ├── configure.mjs           配置读写 CLI（自包含 Cookie 铸造）
 │   ├── install-into-profile.mjs 安装进 profile（幂等）
 │   ├── mock-image-api.mjs      本地假生图服务（返回**真实编码**的 PNG）
-│   ├── test-generate.mjs       生图协议：请求构造 / 回包解析 / SSRF / 超时
+│   ├── test-generate.mjs       生图协议：请求构造 / 回包解析 / SSRF / 超时 / 模型列表
 │   ├── test-plugin.mjs         插件契约：命名空间 / volatile / secret / 确认闸门 /
-│   │                           配置接口 / 落盘 / 自定义保存目录
-│   ├── test-client.mjs         浏览器半：ModuleLoader 加载 / 槽位 / 渲染 / 主题 / 不碰密钥
+│   │                           配置接口 / 落盘 / 自定义保存目录 / 模型识别路由
+│   ├── test-client.mjs         浏览器半：ModuleLoader 加载 / 槽位 / 渲染 / 主题 /
+│   │                           不碰密钥 / 保存路径控件 / 识别模型的交互
 │   ├── test-save.mjs           另存：引用恢复 / 越界拒绝 / 不覆盖 / 扩展名校验
 │   └── test-mock-api.mjs       用插件自己的解析器验证 mock 服务
 ├── README.md

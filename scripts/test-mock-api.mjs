@@ -4,7 +4,7 @@
 // 于是"用了 mock 还是连真实上游"就会变成两套不同的行为，验收结论也就不可信了。
 // 所以这里用插件自己的解析器（decodeImages）来验它。
 import assert from 'node:assert/strict';
-import { decodeImages, generateImages, sniffMediaType } from '../lib/generate.js';
+import { decodeImages, generateImages, listModels, sniffMediaType } from '../lib/generate.js';
 
 const PORT = Number(process.env.MOCK_IMAGE_PORT ?? 18577);
 const BASE = `http://127.0.0.1:${PORT}/v1`;
@@ -87,6 +87,12 @@ await test('走完整链路：generateImages 对 mock 端到端可用', async ()
   assert.equal(result.images.length, 1);
   assert.equal(saved.length, 1);
   assert.equal(saved[0].mediaType, 'image/png');
+});
+
+await test('listModels：能从假服务识别出模型列表（走真实 HTTP）', async () => {
+  const result = await listModels({ config: { apiUrl: BASE, apiKey: 'mock-key' } });
+  assert.deepEqual(result.models, ['mock-image-1', 'mock-image-2']);
+  assert.equal(result.endpoint, `${BASE}/models`);
 });
 
 console.log(failures ? `\n${failures} 个用例失败` : '\n全部通过');

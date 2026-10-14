@@ -21,7 +21,23 @@ async function test(name, fn) {
 /** 造一个最小的 React 桩：只实现 client.js 真正用到的那几个 hook。 */
 function makeReactStub() {
   return {
-    createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }),
+    /**
+     * ⚠️ children 必须**同时**进 props：真实 React 里 children 属于 props，而
+     * `Row` / `Card` / `Button` 都是解构 `{ children }` 来用的。
+     *
+     * 早先这里只把 children 放在 element 顶层，于是这些组件在测试里渲染出的子树
+     * 是空的 —— 测试看不到它们的内容，"点保存按钮""点识别按钮"这类断言全部落空，
+     * 而组件本身在真实环境里其实是好的。桩失真比没有桩更危险：它给你假的安全感。
+     */
+    createElement: (type, props, ...children) => ({
+      type,
+      props: {
+        ...(props ?? {}),
+        children: children.length === 0 ? undefined : children.length === 1 ? children[0] : children,
+      },
+      // 顶层 children 保留：摊平工具按 element 树遍历，这里更直接。
+      children,
+    }),
     useState: (initial) => [typeof initial === 'function' ? initial() : initial, () => {}],
     useEffect: () => {},
     useCallback: (fn) => fn,
@@ -126,28 +142,72 @@ await test('前端绝不持有密钥：不读 apiKey 字段，只读 hasKey/keyH
   assert.match(source, /delete body\.apiKey/, '提交配置时应剔除 apiKey 字段，只在有输入时才带上');
 });
 
-await test('默认保存路径控件读取配置并提交保存', async () => {
-  const state = [{ savePath: 'pictures' }, false, null, '', false, null];
+/**
+ * 有状态 React 桩：useState 按调用顺序分配格子，格子按初始值自动补齐。
+ *
+ * 之所以要"自动补齐"而不是写死数组长度：组件每加一个 useState，固定长度的数组就会
+ * **静默错位** —— 多出来的格子读到 undefined，测试要么崩，要么更糟：放过一个真 bug。
+ */
+function makeStatefulReact(initialByIndex = {}) {
+  const cells = new Map();
   let cursor = 0;
-  const React = { ...makeReactStub(), useState: () => {
-    const index = cursor++;
-    return [state[index], value => { state[index] = typeof value === 'function' ? value(state[index]) : value; }];
-  } };
+  const React = {
+    ...makeReactStub(),
+    useState: (initial) => {
+      const index = cursor++;
+      if (!cells.has(index)) {
+        cells.set(index, index in initialByIndex ? initialByIndex[index] : (typeof initial === 'function' ? initial() : initial));
+      }
+      return [cells.get(index), (next) => {
+        cells.set(index, typeof next === 'function' ? next(cells.get(index)) : next);
+      }];
+    },
+  };
+  return {
+    React,
+    cell: (index) => cells.get(index),
+    /** 每轮渲染前调用：hook 的调用顺序在每一轮里都从 0 重新开始。 */
+    beginRender: () => { cursor = 0; },
+  };
+}
+
+/** 把 element 树摊平成数组（children 可能是嵌套数组或 null）。 */
+function flatten(tree) {
+  if (!tree || typeof tree !== 'object') return [];
+  return [tree, ...(tree.children ?? []).flat(Infinity).flatMap(flatten)];
+}
+
+/** 装配设置页并返回一个"渲染一次"的函数，拿到的是摊平后的 element 列表。 */
+function mountClient(initialByIndex) {
+  const state = makeStatefulReact(initialByIndex);
   let component;
-  definition.factory(() => React).apply({ slots: {
+  definition.factory(() => state.React).apply({ slots: {
     inject: (_key, cb) => cb(), register: (_registration, comp) => { component = comp; },
   } });
-  const render = () => { cursor = 0; return component().type(); };
-  function nodes(tree) {
-    if (!tree || typeof tree !== 'object') return [];
-    return [tree, ...(tree.children ?? []).flat(Infinity).flatMap(nodes)];
-  }
-  let tree = nodes(render());
+  return {
+    state,
+    render: () => { state.beginRender(); return flatten(component().type()); },
+  };
+}
+
+/**
+ * 模型下拉是否已出现。
+ *
+ * ⚠️ 读的是 `Row` element 上的 `hint` prop，而不是它渲染出的文本：摊平工具只遍历
+ * element 树，**不执行自定义组件**，所以 `Row` 内部的 div 根本不在这棵树里。
+ * 找渲染结果会永远找不到 —— 早先就踩了这一下。
+ */
+const hasModelPicker = (tree) => tree.some(n => typeof n.props?.hint === 'string' && n.props.hint.includes('上游共'));
+
+await test('默认保存路径控件读取配置并提交保存', async () => {
+  const { render } = mountClient({ 0: { savePath: 'pictures' } });
+  let tree = render();
   const input = tree.find(n => n.props.placeholder === '留空：./generated-images/');
   assert.equal(input.props.value, 'pictures');
   input.props.onChange('custom-images');
-  tree = nodes(render());
+  tree = render();
   assert.equal(tree.find(n => n.props.placeholder === '留空：./generated-images/').props.value, 'custom-images');
+
   const originalFetch = globalThis.fetch;
   let saved;
   globalThis.fetch = async (_url, init) => {
@@ -155,8 +215,64 @@ await test('默认保存路径控件读取配置并提交保存', async () => {
     return new Response(JSON.stringify(init.method === 'POST' ? { ok: true } : { config: saved }));
   };
   try {
-    await tree.find(n => n.props.tone === 'primary' && n.children.includes('保存')).props.onClick();
+    await tree.find(n => n.props.tone === 'primary' && String(n.props.children) === '保存').props.onClick();
     assert.equal(saved.savePath, 'custom-images');
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+await test('识别上游模型：渲染不请求，点按钮才打 /models，成功后出现可选下拉', async () => {
+  const { state, render } = mountClient({ 0: { apiUrl: 'https://x.example.com/v1', model: '' } });
+
+  let tree = render();
+  const button = tree.find(n => String(n.props?.children) === '识别上游模型');
+  assert.ok(button, '设置页应有「识别上游模型」按钮');
+  assert.equal(hasModelPicker(tree), false, '还没识别时不应出现模型下拉');
+
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url: String(url), method: init?.method ?? 'GET' });
+    return new Response(JSON.stringify({ ok: true, models: ['gpt-image-1', 'dall-e-3'], count: 2 }), { status: 200 });
+  };
+  try {
+    // 打开设置页本身**绝不能**打上游 —— 那等于替用户发了一次他没要的请求。
+    assert.equal(calls.length, 0, '渲染本身不应触发上游请求');
+    await button.props.onClick();
+    assert.equal(calls.length, 1);
+    assert.match(calls[0].url, /\/api\/image-tool\/models$/);
+    assert.equal(calls[0].method, 'GET');
+
+    tree = render();
+    assert.equal(hasModelPicker(tree), true, '识别成功后应出现模型下拉');
+    const select = tree.find(n => Array.isArray(n.props?.options)
+      && n.props.options.some(o => o.value === 'gpt-image-1'));
+    assert.ok(select, '下拉里应有识别到的模型');
+    assert.deepEqual(select.props.options.map(o => o.value), ['', 'gpt-image-1', 'dall-e-3']);
+    assert.equal(state.cell(6).length, 2, '识别结果应存进 models 状态');
+
+    // 选中即填入输入框；**不自动保存** —— 仍然要用户点「保存」。
+    select.props.onChange('gpt-image-1');
+    tree = render();
+    assert.equal(tree.find(n => n.props.placeholder === 'gpt-image-1').props.value, 'gpt-image-1');
+    assert.equal(state.cell(0).model, 'gpt-image-1');
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+await test('识别失败：显示上游给的原因，且不留下过期下拉', async () => {
+  const { render } = mountClient({ 0: { apiUrl: 'https://x.example.com/v1', model: '' } });
+  let tree = render();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(
+    JSON.stringify({ ok: false, error: '上游没有返回任何模型。有些服务不提供 /models 端点，请手动填写模型名。' }),
+    { status: 400 },
+  );
+  try {
+    await tree.find(n => String(n.props?.children) === '识别上游模型').props.onClick();
+    tree = render();
+    assert.equal(hasModelPicker(tree), false, '识别失败后不应留下可选下拉');
+    const failed = tree.find(n => String(n.children ?? '').includes('识别失败'));
+    assert.ok(failed, '应把失败原因显示给用户');
+    assert.match(String(failed.children), /不提供 \/models 端点/);
   } finally { globalThis.fetch = originalFetch; }
 });
 

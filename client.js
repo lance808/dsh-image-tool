@@ -155,6 +155,8 @@ window.__ModuleLoader__.load({
       const [apiKeyInput, setApiKeyInput] = useState('')
       const [busy, setBusy] = useState(false)
       const [message, setMessage] = useState(null)
+      const [models, setModels] = useState([])
+      const [detecting, setDetecting] = useState(false)
 
       const note = useCallback((text, tone = 'muted') => {
         setMessage(text ? { text, color: tone === 'error' ? T.error : tone === 'success' ? T.success : T.muted } : null)
@@ -199,6 +201,8 @@ window.__ModuleLoader__.load({
             throw new Error(payload.error ?? `HTTP ${response.status}`)
           }
           await load()
+          // apiUrl / 密钥可能刚刚改过，旧的模型列表就不再可信 —— 清掉，让用户重新识别。
+          setModels([])
           note('已保存，下一次调用即生效。', 'success')
         } catch (error) {
           note(`保存失败：${error?.message ?? error}`, 'error')
@@ -226,6 +230,30 @@ window.__ModuleLoader__.load({
           setBusy(false)
         }
       }, [load, note])
+
+      /**
+       * 识别上游模型。
+       *
+       * 只在点了按钮时才打上游 —— 打开设置页**不**自动请求：那等于每次进设置都替你
+       * 发一次网络请求，而且会在你还没填完 Key 的时候就报错。
+       */
+      const detectModels = useCallback(async () => {
+        setDetecting(true)
+        note('正在向上游查询模型列表…')
+        try {
+          const response = await fetch(`${API}/models`, { headers: { accept: 'application/json' } })
+          const payload = await response.json().catch(() => ({}))
+          if (!response.ok || payload.ok !== true) throw new Error(payload.error ?? `HTTP ${response.status}`)
+          const list = Array.isArray(payload.models) ? payload.models : []
+          setModels(list)
+          note(`识别到 ${list.length} 个模型，可在下方下拉里选择。`, 'success')
+        } catch (error) {
+          setModels([])
+          note(`识别失败：${error?.message ?? error}`, 'error')
+        } finally {
+          setDetecting(false)
+        }
+      }, [note])
 
       const ready = hasKey && String(config?.apiUrl ?? '').trim() !== ''
 
@@ -275,12 +303,29 @@ window.__ModuleLoader__.load({
             }),
             hasKey ? h(Button, { onClick: clearKey, disabled: busy, tone: 'danger' }, '清除') : null,
           ),
-          h(Row, { label: '生图模型', hint: '留空则不发送 model 字段，由上游决定' },
-            h(Input, {
-              value: config.model,
-              onChange: value => set('model', value),
-              placeholder: 'gpt-image-1',
-            }),
+          h('div', null,
+            h(Row, { label: '生图模型', hint: '留空则不发送 model 字段，由上游决定。也可点右侧按钮从上游识别' },
+              h('div', { style: { display: 'flex', gap: 8, alignItems: 'center', width: '100%', minWidth: 0 } },
+                h('div', { style: { flex: '1 1 auto', minWidth: 0 } },
+                  h(Input, {
+                    value: config.model,
+                    onChange: value => set('model', value),
+                    placeholder: 'gpt-image-1',
+                  }),
+                ),
+                h(Button, { onClick: detectModels, disabled: busy || detecting }, detecting ? '识别中…' : '识别上游模型'),
+              ),
+            ),
+            models.length > 0
+              ? h(Row, { label: '选择模型', hint: `上游共 ${models.length} 个模型；选中即填入上面的输入框` },
+                  h(Select, {
+                    value: '',
+                    onChange: value => { if (value !== '') set('model', value) },
+                    options: [{ value: '', label: `（共 ${models.length} 个，点此选择）` }]
+                      .concat(models.map(name => ({ value: name, label: name }))),
+                  }),
+                )
+              : null,
           ),
         ),
 
