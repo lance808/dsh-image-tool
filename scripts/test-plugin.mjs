@@ -10,16 +10,19 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { FIXTURE_PNG } from './png-fixture.mjs';
 import {
   Config,
   SETTINGS_NAMESPACE,
   TOOL_NAME,
+  TOOL_NAME_EDIT,
   apply,
   cwdFromExecution,
   makeConfigReader,
   makeDiskSaver,
   makeImageFetcher,
   requestConfirmation,
+  runEdit,
   runGenerate,
 } from '../lib/index.js';
 
@@ -157,12 +160,12 @@ function reassemble(ctx) {
 await test('重新装配（volatile 更新）不会因工具/路由重名而失败', () => {
   const ctx = makeCtx();
   apply(ctx, {});
-  assert.equal(ctx.registered.length, 2, '首次装配应注册一个工具');
+  assert.equal(ctx.registered.length, 3, '首次装配应注册生图、改图、另存三个工具');
   assert.equal(ctx.routes.length, 1, '首次装配应挂载一条路由');
   // 反复重装：旧实现（直接 register、不经 effect）会在第二次就抛 duplicate 而失败。
   for (let round = 1; round <= 3; round += 1) {
     assert.doesNotThrow(() => reassemble(ctx), `第 ${round} 次重装不应抛错`);
-    assert.equal(ctx.registered.length, 2, `第 ${round} 次重装后应恰好一个工具（不是零、也不是两个）`);
+    assert.equal(ctx.registered.length, 3, `第 ${round} 次重装后应恰好三个工具（不是零、也不是六个）`);
     assert.equal(ctx.routes.length, 1, `第 ${round} 次重装后应恰好一条路由`);
   }
 });
@@ -231,7 +234,7 @@ await test('makeConfigReader：优先读 settings 的实时值，读不到回退
 await test('apply：注册了工具，且工具定义形状正确', () => {
   const ctx = makeCtx();
   apply(ctx, {});
-  assert.equal(ctx.registered.length, 2);
+  assert.equal(ctx.registered.length, 3, '生图、改图、另存三个工具都要注册');
   const tool = ctx.registered[0];
   assert.equal(tool.name, TOOL_NAME);
   assert.equal(typeof tool.execute, 'function');
@@ -239,12 +242,36 @@ await test('apply：注册了工具，且工具定义形状正确', () => {
   assert.equal(tool.parameters.additionalProperties, false);
   assert.equal(typeof tool.output.render, 'function');
   assert.ok(tool.output.schema, '必须声明 output.schema');
+  assert.equal(typeof tool.output.presentationMeta, 'function', '必须声明 output.presentationMeta（界面卡片靠它拿落盘路径）');
+});
+
+await test('apply：改图工具被注册，且参数与卡片契约正确', () => {
+  const ctx = makeCtx();
+  apply(ctx, {});
+  const tool = ctx.registered.find((item) => item.name === TOOL_NAME_EDIT);
+  assert.ok(tool, `必须注册 ${TOOL_NAME_EDIT}`);
+  assert.equal(typeof tool.execute, 'function');
+  assert.deepEqual(tool.parameters.required, ['prompt'], '改图只强制 prompt：原图可以省略（取会话最近一张）');
+  assert.ok(tool.parameters.properties.image, '必须暴露 image 参数');
+  assert.ok(tool.parameters.properties.mask, '必须暴露 mask 参数（局部重绘）');
+  assert.equal(tool.parameters.additionalProperties, false);
+  // 界面卡片按工具名分派，host 半注册的名字与客户端注册的 key 必须能对上。
+  assert.equal(tool.output.render({}, { ok: true, note: 'n', images: [] })[0].type, 'text');
+  const meta = tool.output.presentationMeta({}, {
+    ok: true,
+    note: 'n',
+    origin: '会话里最近一张图片 att-9',
+    images: [{ ref: { attachmentId: 'att-9', mediaType: 'image/png', bytes: 5, width: 4, height: 3, name: 'a.png' }, diskPath: 'D:\\w\\generated-images\\edited-1.png' }],
+  });
+  assert.equal(meta.images[0].diskPath, 'D:\\w\\generated-images\\edited-1.png', '卡片要能从 meta 拿到落盘路径');
+  assert.equal(meta.images[0].attachmentId, 'att-9');
+  assert.equal(meta.origin, '会话里最近一张图片 att-9');
 });
 
 await test('apply：没有 webServer 时不挂外部接口，但工具照常注册', () => {
   const ctx = makeCtx({ webServer: false });
   apply(ctx, {});
-  assert.equal(ctx.registered.length, 2, '工具必须照常注册');
+  assert.equal(ctx.registered.length, 3, '工具必须照常注册');
   assert.equal(ctx.routes.length, 0, '没有 webServer 就不该注册路由');
 });
 
@@ -616,7 +643,7 @@ await test('/generate 缺鉴权服务时拒绝，绝不调用生成函数', asyn
 });
 
 await test('apply：外部生成后 fetchUrl 能通过真实接线读回附件字节', async () => {
-  const PNG = fs.readFileSync(path.join(ROOT, '_preview/shiyi-1.png'));
+  const PNG = FIXTURE_PNG;
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () => new Response(JSON.stringify({ data: [{ b64_json: PNG.toString('base64') }] }));
   try {
@@ -643,7 +670,7 @@ await test('execute：平台标准 agent.id 上下文会将真实 PNG 落盘', a
   const fsp = await import('node:fs/promises');
   const os = await import('node:os');
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-image-execute-'));
-  const PNG = fs.readFileSync(path.join(ROOT, '_preview/shiyi-1.png'));
+  const PNG = FIXTURE_PNG;
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () => new Response(JSON.stringify({ data: [{ b64_json: PNG.toString('base64') }] }));
   try {
@@ -682,7 +709,7 @@ await test('保存路径：留空保持默认，相对和绝对目录均按配�
   const os = await import('node:os');
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'image-path-config-'));
   const originalFetch = globalThis.fetch;
-  const PNG = fs.readFileSync(path.join(ROOT, '_preview/shiyi-1.png'));
+  const PNG = FIXTURE_PNG;
   globalThis.fetch = async () => new Response(JSON.stringify({ data: [{ b64_json: PNG.toString('base64') }] }));
   try {
     for (const [savePath, expected] of [
@@ -704,6 +731,175 @@ await test('保存路径：留空保持默认，相对和绝对目录均按配�
       assert.match(result.note, /已生成至/);
     }
   } finally { globalThis.fetch = originalFetch; await fsp.rm(dir, { recursive: true, force: true }); }
+});
+
+// ── 改图（image_edit → /images/edits） ──────────────────────────────────────
+
+/** 造一个带工作目录与会话图片的 sessions 假体（改图必需的两个事实）。 */
+function withSession(ctx, { cwd, refs = [], id = 'session-edit' } = {}) {
+  ctx.sessions.get = (sessionId) => {
+    assert.equal(sessionId, id);
+    return {
+      header: { cwd },
+      deriveMessages: () => (refs.length === 0 ? [] : [{ role: 'user', content: refs.map((ref) => ({ type: 'image', attachment: ref })) }]),
+    };
+  };
+  ctx.attachments.readImage = async (ref) => ({ ref, data: FIXTURE_PNG });
+}
+
+await test('execute：改图走 multipart，原图取会话最近一张，来源与落盘都在结果里', async () => {
+  const fsp = await import('node:fs/promises');
+  const os = await import('node:os');
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-image-edit-'));
+  const PNG = FIXTURE_PNG;
+  const ref = { attachmentId: 'sha256:src', mediaType: 'image/png', bytes: PNG.byteLength, width: 8, height: 8, name: 'src.png' };
+  const originalFetch = globalThis.fetch;
+  let seen = null;
+  globalThis.fetch = async (url, init) => {
+    seen = { url, init };
+    return new Response(JSON.stringify({ data: [{ b64_json: PNG.toString('base64') }] }), { status: 200 });
+  };
+  try {
+    const ctx = makeCtx({ config: { apiUrl: 'https://x.example.com/v1', apiKey: 'k', editModel: 'edit-m', confirmBeforeEdit: false } });
+    withSession(ctx, { cwd: dir, refs: [ref] });
+    apply(ctx, {});
+    const tool = ctx.registered.find((item) => item.name === TOOL_NAME_EDIT);
+    const result = await tool.execute({ prompt: '改成夜景' }, { agent: { id: 'session-edit' } });
+
+    assert.equal(result.ok, true, result.note);
+    assert.equal(seen.url, 'https://x.example.com/v1/images/edits', '改图必须走 edits 端点，而不是 generations');
+    assert.equal(seen.init.body.get('prompt'), '改成夜景');
+    assert.equal(seen.init.body.get('model'), 'edit-m');
+    assert.ok(seen.init.body.get('image') instanceof Blob, '原图作为二进制字段上传');
+    assert.match(result.origin, /最近一张图片 sha256:src/, '必须回报实际用了哪张原图');
+    assert.match(result.note, /原图来源：/);
+    assert.match(result.note, /已改图 1 张图片/);
+    assert.match(result.note, /不要使用 markdown 图片语法/, '否则模型会自己编一个 URL 再贴一张图');
+    assert.deepEqual(await fsp.readFile(result.images[0].diskPath), PNG, '改图产物同样要落盘');
+    assert.ok(!JSON.stringify(result.images).includes('base64'), '返回值里不能带字节');
+  } finally {
+    globalThis.fetch = originalFetch;
+    await fsp.rm(dir, { recursive: true, force: true });
+  }
+});
+
+await test('execute：改图确认框写明改的是哪张图，取消后一个字节都不发', async () => {
+  const originalFetch = globalThis.fetch;
+  let fetched = 0;
+  let asked = null;
+  globalThis.fetch = async () => { fetched += 1; return new Response('{}', { status: 200 }); };
+  try {
+    const ctx = makeCtx({
+      config: { apiUrl: 'https://x.example.com/v1', apiKey: 'k' },
+      userQuestions: { ask: async (request) => { asked = request; return { answers: [{ selected: ['取消'] }] }; } },
+    });
+    apply(ctx, {});
+    const tool = ctx.registered.find((item) => item.name === TOOL_NAME_EDIT);
+    const result = await tool.execute({ prompt: '改成夜景', image: 'pictures/in.png' }, { agent: { id: 's' } });
+
+    assert.equal(result.ok, false);
+    assert.match(result.note, /取消/);
+    assert.equal(fetched, 0, '用户取消后绝不能真的调上游');
+    assert.match(asked.questions[0].header, /改图确认/);
+    assert.match(asked.questions[0].question, /原图：pictures\/in\.png/, '确认框必须说清改的是哪张图');
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+await test('execute：会话里没有图又没给 image 时，给出可执行的替代方案且不发请求', async () => {
+  const originalFetch = globalThis.fetch;
+  let fetched = 0;
+  globalThis.fetch = async () => { fetched += 1; return new Response('{}', { status: 200 }); };
+  try {
+    const ctx = makeCtx({ config: { apiUrl: 'https://x.example.com/v1', apiKey: 'k', confirmBeforeEdit: false } });
+    withSession(ctx, { cwd: ROOT, refs: [] });
+    apply(ctx, {});
+    const tool = ctx.registered.find((item) => item.name === TOOL_NAME_EDIT);
+    const result = await tool.execute({ prompt: '改成夜景' }, { agent: { id: 'session-edit' } });
+    assert.equal(result.ok, false);
+    assert.match(result.note, /没有可用的图片/);
+    assert.match(result.note, /工作目录内的图片路径/, '错误信息要告诉模型下一步能怎么做');
+    assert.equal(fetched, 0);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+await test('runEdit：原图路径越界（..）被拒绝，且不发请求', async () => {
+  const fsp = await import('node:fs/promises');
+  const os = await import('node:os');
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-image-edit-jail-'));
+  const originalFetch = globalThis.fetch;
+  let fetched = 0;
+  globalThis.fetch = async () => { fetched += 1; return new Response('{}', { status: 200 }); };
+  try {
+    const ctx = makeCtx();
+    const result = await runEdit(ctx, {
+      config: { apiUrl: 'https://x.example.com/v1', apiKey: 'k' },
+      args: { prompt: 'x', image: '../outside.png' },
+      cwd: dir,
+      session: { deriveMessages: () => [] },
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.note, /工作目录内/);
+    assert.equal(fetched, 0, '路径不合法时一个字节都不该发出去');
+  } finally {
+    globalThis.fetch = originalFetch;
+    await fsp.rm(dir, { recursive: true, force: true });
+  }
+});
+
+await test('/edit：缺鉴权服务时拒绝；缺 cwd 时把原因说破', async () => {
+  const { registerImageRoutes } = await import('../lib/routes.js');
+  let route;
+  let called = 0;
+  registerImageRoutes({ register(r) { route = r; return () => {}; } }, {
+    readConfig: () => ({ apiUrl: 'https://x.example.com/v1', apiKey: 'k' }),
+    runEdit: async () => { called += 1; return { ok: true, note: 'n', images: [] }; },
+  });
+  // 没有 connection 服务 → 写操作/花钱的操作一律拒绝
+  const denied = fakeRes();
+  await route.handler(fakeReq('POST', '/api/image-tool/edit', { prompt: 'x' }), denied);
+  assert.equal(denied.out.status, 403);
+  assert.equal(called, 0, '没有鉴权就不能替你花钱改图');
+});
+
+await test('/edit：传了 cwd 时按路径读原图、落盘，并返回取字节地址', async () => {
+  const fsp = await import('node:fs/promises');
+  const os = await import('node:os');
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-image-edit-http-'));
+  const PNG = FIXTURE_PNG;
+  await fsp.writeFile(path.join(dir, 'in.png'), PNG);
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({ data: [{ b64_json: PNG.toString('base64') }] }), { status: 200 });
+  try {
+    const ctx = makeCtx({ config: { apiUrl: 'https://x.example.com/v1', apiKey: 'k', confirmBeforeEdit: false } });
+    apply(ctx, {});
+    const out = await callRoute(ctx, 'POST', '/edit', { prompt: 'x', image: 'in.png', cwd: dir });
+    assert.equal(out.status, 200, JSON.stringify(out.body));
+    assert.equal(out.body.ok, true);
+    assert.equal(out.body.images.length, 1);
+    assert.match(out.body.images[0].fetchUrl, /^\/api\/image-tool\/image\?id=/);
+    assert.match(out.body.images[0].diskPath, /generated-images[\\/]edited-/, 'HTTP 调用也要在 cwd 下留一份');
+    assert.match(out.body.origin, /工作目录文件 in\.png/, '用了哪张原图要如实回报');
+  } finally {
+    globalThis.fetch = originalFetch;
+    await fsp.rm(dir, { recursive: true, force: true });
+  }
+});
+
+await test('/edit：没传 cwd 时把"缺边界"这件事直接说破', async () => {
+  const { registerImageRoutes } = await import('../lib/routes.js');
+  let route;
+  registerImageRoutes({ register(r) { route = r; return () => {}; } }, {
+    readConfig: () => ({ apiUrl: 'https://x.example.com/v1', apiKey: 'k' }),
+    // 有鉴权，才走得到"缺 cwd"这一层（缺鉴权是 403，连 runEdit 都不会调）。
+    connection: { requestRejection: () => undefined },
+    // 真实 runEdit 在 cwd 缺失时的报错文案：HTTP 场景下"没有会话"是正常的，
+    // 所以这一层要补上"那该怎么办"，否则调用方只能干看着一句无解的错误。
+    runEdit: async () => ({ ok: false, note: '未取得会话工作目录，无法按路径读取原图', images: [] }),
+  });
+  const res = fakeRes();
+  await route.handler(fakeReq('POST', '/api/image-tool/edit', { prompt: 'x', image: 'in.png' }), res);
+  assert.equal(res.out.status, 400);
+  assert.match(res.out.body.error, /请在请求体里传 cwd/);
 });
 
 // ── 识别上游模型（设置页的「识别上游模型」按钮） ─────────────────────────────

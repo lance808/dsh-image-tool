@@ -25,7 +25,25 @@ window.__ModuleLoader__.load({
     const module = { exports: {} }
     const exports = module.exports
     const React = require('react')
-    const { createElement: h, useState, useEffect, useCallback } = React
+    const { createElement: h, useState, useEffect, useCallback, useMemo, useRef } = React
+
+    /**
+     * 全屏查看用 portal。
+     *
+     * 为什么非要 portal：内联的 `position: fixed` 会被任一祖先的 `transform` /
+     * `overflow` / `contain` 变成"相对该祖先定位"，图片就会被裁在工具卡片那一小块里。
+     * 平台自己的浮层也是挂到 body 上的。
+     *
+     * 拿不到 react-dom 时不假装能做到：退回"就地渲染 fixed 层"，功能可用（可能被裁），
+     * 而不是整张卡片崩掉 —— 卡片渲染抛错会被宿主永久弃用，代价远大于少一个浮层。
+     */
+    let createPortal = null
+    try { createPortal = require('react-dom').createPortal ?? null } catch { createPortal = null }
+    // 第二档兜底：外壳可能把 ReactDOM 挂在 window 上而不是模块表里。
+    // 两档都没有就降级（见上），功能可用、只是浮层可能被祖先容器裁切。
+    if (typeof createPortal !== 'function' && typeof window !== 'undefined' && window.ReactDOM?.createPortal) {
+      createPortal = window.ReactDOM.createPortal
+    }
 
     /** 只声明真正用到的 client 服务，与 host 半的 inject 是两回事。 */
     const inject = ['slots']
@@ -42,6 +60,7 @@ window.__ModuleLoader__.load({
       surface: 'var(--dsw-alias-bg-layer-1)',
       surface2: 'var(--dsw-alias-bg-layer-2)',
       brand: 'var(--dsw-alias-brand-primary)',
+      overlay: 'var(--dsw-alias-bg-overlay)',
       error: 'var(--dsw-alias-state-error-primary)',
       success: 'var(--dsw-alias-state-success-primary)',
       warn: 'var(--dsw-alias-state-warn-primary)',
@@ -146,6 +165,304 @@ window.__ModuleLoader__.load({
         title ? h('div', { style: { color: T.text, fontSize: 14, fontWeight: 600, marginBottom: subtitle ? 2 : 10 } }, title) : null,
         subtitle ? h('div', { style: { color: T.muted, fontSize: 12, marginBottom: 10, lineHeight: 1.6 } }, subtitle) : null,
         children,
+      )
+    }
+
+    // ── 工具卡片：把生成/修改的图片真正画出来 ────────────────────────────────
+    //
+    // 为什么需要这一整块：平台内置的图片卡片**只认 `read_image` 这一个工具名**
+    // （ui-tool 的 `imageCardModel` 里写死 `call?.name !== 'read_image'` 就返回空），
+    // 其余工具落到通用卡片，而通用卡片把非文本内容块 `JSON.stringify` 之后直接显示 ——
+    // 也就是说，不注册这张卡，用户在对话里看到的是一坨附件引用 JSON，不是图片。
+    //
+    // 三条必须守住的契约（都是踩过才知道的）：
+    //   ① `tool.call.toolview` 的 key 必须**逐字等于工具名**；keyed 槽位同 key 同优先级
+    //      会抛错（热重载直接 fatal），所以传 `priority: -1`。
+    //   ② **不能**声明 `tool.call.images` 子槽：内置 read_image 的 toolview 已经声明了它，
+    //      一个子槽只能由一个 entry 声明，重复声明会让整条注册失败。
+    //   ③ 取字节只能走 owner props 给的 `loadImage(attachment)`（会话授权加载器）；
+    //      自己拼 URL 拿不到授权。并且我们的 inject face 里**不能**出现 loadImage 这个名字
+    //      —— 渲染器展开顺序是 {...injected, ...slotProps, ...ownerProps}，同名会被静默
+    //      覆盖，只表现为运行期取图走到错的分支。
+
+    /** 这两个工具名的卡片由本插件提供，与 host 半注册的工具名逐字一致。 */
+    const IMAGE_TOOL_KEYS = ['generate_image', 'image_edit']
+
+    /** 工具结果的内容块；兼容 `block.result.content` 这层包装。 */
+    function resultContentOf(block) {
+      if (block && Array.isArray(block.content)) return block.content
+      if (block && block.result && Array.isArray(block.result.content)) return block.result.content
+      return []
+    }
+
+    /** host 半的 presentationMeta（落盘路径等界面事实）；两个位置都读一遍。 */
+    function resultMetaOf(block) {
+      const candidates = [block ? block.meta : null, block && block.result ? block.result.meta : null]
+      for (const value of candidates) {
+        if (value && typeof value === 'object' && Array.isArray(value.images)) return value
+      }
+      return null
+    }
+
+    /** 结果里的图片附件引用，按顺序。 */
+    function imageAttachmentsOf(content) {
+      const out = []
+      for (const part of content) {
+        if (!part || typeof part !== 'object') continue
+        if (part.type === 'image' && part.attachment && typeof part.attachment === 'object') out.push(part.attachment)
+      }
+      return out
+    }
+
+    function textOf(content) {
+      return content
+        .filter(part => part && part.type === 'text' && typeof part.text === 'string')
+        .map(part => part.text)
+        .join('\n')
+    }
+
+    function formatBytes(value) {
+      const bytes = Number(value)
+      if (!Number.isFinite(bytes) || bytes <= 0) return ''
+      if (bytes < 1024) return `${bytes} B`
+      if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`
+      return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+    }
+
+    /** 绝对路径 → 相对会话工作目录的写法（openFile 与人读都更顺眼）。 */
+    function relativizeToCwd(cwd, file) {
+      if (typeof file !== 'string' || file === '') return null
+      if (typeof cwd !== 'string' || cwd === '') return file
+      const separator = cwd.includes('\\') ? '\\' : '/'
+      const root = cwd.endsWith(separator) ? cwd : cwd + separator
+      if (!file.startsWith(root)) return file
+      return './' + file.slice(root.length).split('\\').join('/')
+    }
+
+    const linkStyle = {
+      color: T.brand,
+      fontSize: 11,
+      textDecoration: 'none',
+      border: `1px solid ${T.border}`,
+      borderRadius: 6,
+      padding: '2px 8px',
+      whiteSpace: 'nowrap',
+    }
+
+    const linkButtonStyle = {
+      ...linkStyle,
+      background: 'transparent',
+      font: 'inherit',
+      cursor: 'pointer',
+    }
+
+    /**
+     * 全屏查看。
+     *
+     * 必须 portal 到 body：内联的 `position: fixed` 会被任一祖先的 transform /
+     * overflow / contain 变成"相对该祖先定位"，图片就被裁在工具卡片那一小块里。
+     * 拿不到 react-dom 时退回就地渲染 —— 少一个浮层，好过整张卡片崩掉
+     * （卡片渲染抛错会被宿主永久弃用）。
+     */
+    function Lightbox({ src, label, onClose }) {
+      useEffect(() => {
+        const onKey = event => { if (event.key === 'Escape') onClose() }
+        document.addEventListener('keydown', onKey)
+        const previous = document.body.style.overflow
+        document.body.style.overflow = 'hidden'
+        return () => {
+          document.removeEventListener('keydown', onKey)
+          document.body.style.overflow = previous
+        }
+      }, [onClose])
+      const overlay = h('div', {
+        role: 'dialog',
+        'aria-modal': 'true',
+        'aria-label': label,
+        onClick: onClose,
+        style: {
+          position: 'fixed', inset: 0, zIndex: 2000,
+          // 用平台的浮层色令牌而不是写死的半透明黑：浅色主题下黑底白字虽然也能看，
+          // 但那是一块"不属于这个界面"的颜色，会被主题切换立刻暴露出来。
+          background: T.overlay,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          padding: 24, cursor: 'zoom-out',
+        },
+      },
+        h('img', {
+          src, alt: label,
+          onClick: event => event.stopPropagation(),
+          style: { maxWidth: '92vw', maxHeight: '90vh', objectFit: 'contain', borderRadius: 8, border: `1px solid ${T.border}` },
+        }),
+        h('div', {
+          style: { position: 'fixed', top: 16, right: 20, display: 'flex', gap: 10, alignItems: 'center' },
+          onClick: event => event.stopPropagation(),
+        },
+          h('a', { href: src, download: label, style: { ...linkStyle, background: T.surface, fontSize: 12, padding: '4px 10px' } }, '下载'),
+          h('button', {
+            type: 'button',
+            onClick: onClose,
+            style: { color: T.text, background: T.surface, border: `1px solid ${T.border}`, borderRadius: 6, padding: '4px 10px', fontSize: 12, font: 'inherit', cursor: 'pointer' },
+          }, '关闭（Esc）'),
+        ),
+      )
+      return createPortal ? createPortal(overlay, document.body) : overlay
+    }
+
+    /**
+     * 一张图片：缩略图 + 尺寸信息 + 下载 / 在本地打开。
+     *
+     * 两条加载失败路径都要接住：promise 失败（未授权、附件已被清理）与 `<img onError>`
+     * （URL 拿到了但读不出来）。只接一条的话，另一种情况会留一个裂图图标在那儿。
+     */
+    function ImageThumb({ attachment, index, diskPath, loadImage, cwd, openFile, onZoom }) {
+      const [url, setUrl] = useState(() => {
+        try { return loadImage?.peek?.(attachment) ?? null } catch { return null }
+      })
+      const [failed, setFailed] = useState(false)
+
+      useEffect(() => {
+        let alive = true
+        setFailed(false)
+        if (typeof loadImage !== 'function') {
+          setFailed(true)
+          return () => { alive = false }
+        }
+        let pending
+        try {
+          pending = loadImage(attachment)
+        } catch {
+          setFailed(true)
+          return () => { alive = false }
+        }
+        Promise.resolve(pending).then(value => {
+          if (!alive) return
+          if (typeof value === 'string' && value !== '') setUrl(value)
+          else setFailed(true)
+        }).catch(() => { if (alive) setFailed(true) })
+        return () => { alive = false }
+      }, [attachment, loadImage])
+
+      const label = attachment?.name || `图片 ${index + 1}`
+      const relative = diskPath ? relativizeToCwd(cwd, diskPath) : null
+      const dimensions = attachment?.width && attachment?.height ? `${attachment.width}×${attachment.height}` : '尺寸未知'
+      const size = formatBytes(attachment?.bytes)
+
+      return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6, width: 168 } },
+        h('button', {
+          type: 'button',
+          onClick: () => { if (url && !failed) onZoom({ url, label }) },
+          title: failed ? '图片加载失败' : '点击全屏查看',
+          style: {
+            width: 168, height: 168, padding: 0, overflow: 'hidden',
+            border: `1px solid ${T.border}`, borderRadius: 8, background: T.surface2,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            cursor: url && !failed ? 'zoom-in' : 'default',
+          },
+        }, url && !failed
+          ? h('img', {
+              src: url, alt: label,
+              onError: () => setFailed(true),
+              style: { width: '100%', height: '100%', objectFit: 'cover', display: 'block' },
+            })
+          : h('span', { style: { color: failed ? T.error : T.muted, fontSize: 11, padding: 8, textAlign: 'center' } },
+              failed ? '图片加载失败' : '加载中…')),
+        h('div', { style: { color: T.muted, fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
+          size ? `${dimensions} · ${size}` : dimensions),
+        h('div', { style: { display: 'flex', gap: 6 } },
+          url && !failed ? h('a', { href: url, download: label, style: linkStyle }, '下载') : null,
+          relative ? h('button', {
+            type: 'button',
+            onClick: () => openFile?.(relative),
+            title: relative,
+            style: linkButtonStyle,
+          }, '打开') : null),
+      )
+    }
+
+    /**
+     * `generate_image` / `image_edit` 的工具卡。
+     *
+     * 展开状态自己管，而不是用 owner 给的 `useDisclosure`：后者是外部传入的 Hook，
+     * "存在才调用"会违反 Hook 调用规则，而无条件调用又要求宿主一定给 —— 一个纯粹的
+     * 折叠状态不值得赌这个契约。
+     */
+    function ImageResultRow(props) {
+      const { block, phase, toolName, cwd, loadImage, openFile } = props
+      const [expanded, setExpanded] = useState(true)
+      const [zoom, setZoom] = useState(null)
+      const [elapsed, setElapsed] = useState(0)
+      const running = phase !== 'result'
+
+      useEffect(() => {
+        if (!running) return undefined
+        const started = Date.now()
+        const timer = setInterval(() => setElapsed(Math.round((Date.now() - started) / 1000)), 1000)
+        return () => clearInterval(timer)
+      }, [running])
+
+      const content = useMemo(() => (running ? [] : resultContentOf(block)), [block, running])
+      const meta = useMemo(() => (running ? null : resultMetaOf(block)), [block, running])
+      const attachments = useMemo(() => imageAttachmentsOf(content), [content])
+      const text = useMemo(() => textOf(content), [content])
+      const failed = !running && block?.isError === true
+      const verb = toolName === 'image_edit' ? '改图' : '生成图片'
+
+      const summary = running
+        ? `正在${verb}… 已等待 ${elapsed}s（同步接口几十秒很正常）`
+        : failed
+          ? '失败'
+          : attachments.length > 0
+            ? `${attachments.length} 张 · ${attachments[0]?.width ?? '?'}×${attachments[0]?.height ?? '?'}`
+            : '没有产出图片'
+
+      return h('div', {
+        style: { border: `1px solid ${T.border}`, borderRadius: 10, background: T.surface, overflow: 'hidden', margin: '2px 0' },
+      },
+        h('button', {
+          type: 'button',
+          onClick: () => setExpanded(value => !value),
+          style: {
+            width: '100%', display: 'flex', alignItems: 'center', gap: 10,
+            padding: '8px 12px', background: 'transparent', border: 'none',
+            font: 'inherit', cursor: 'pointer', textAlign: 'left',
+          },
+        },
+          h('span', { style: { color: T.text, fontSize: 13, fontWeight: 600, flex: '0 0 auto' } }, verb),
+          h('span', {
+            style: { color: failed ? T.error : T.muted, fontSize: 12, flex: '1 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+          }, summary),
+          h('span', { style: { color: T.muted, fontSize: 11, flex: '0 0 auto' } }, expanded ? '收起' : '展开'),
+        ),
+        expanded && (attachments.length > 0 || text || meta?.origin)
+          ? h('div', { style: { padding: '4px 12px 14px', display: 'flex', flexDirection: 'column', gap: 12 } },
+              attachments.length > 0
+                ? h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 12 } },
+                    ...attachments.map((attachment, index) => h(ImageThumb, {
+                      key: attachment?.attachmentId ?? `image-${index}`,
+                      attachment,
+                      index,
+                      diskPath: meta?.images?.[index]?.diskPath ?? null,
+                      loadImage,
+                      cwd,
+                      openFile,
+                      onZoom: setZoom,
+                    })))
+                : null,
+              meta?.origin
+                ? h('div', { style: { color: T.muted, fontSize: 11 } }, `原图：${meta.origin}`)
+                : null,
+              text
+                ? h('pre', {
+                    style: {
+                      margin: 0, padding: 10, borderRadius: 6, overflowX: 'auto',
+                      background: T.surface2, color: T.muted, fontSize: 11.5, lineHeight: 1.7,
+                      border: `1px solid ${T.border}`, whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                    },
+                  }, text)
+                : null)
+          : null,
+        zoom ? h(Lightbox, { src: zoom.url, label: zoom.label, onClose: () => setZoom(null) }) : null,
       )
     }
 
@@ -360,8 +677,9 @@ window.__ModuleLoader__.load({
         h('div', { style: { marginBottom: 14 } },
           h('div', { style: { fontSize: 16, fontWeight: 600 } }, '图像生成'),
           h('div', { style: { color: T.muted, fontSize: 12, marginTop: 4, lineHeight: 1.6 } },
-            '把外部生图服务接成平台工具。模型在对话里调用 generate_image 即可出图，'
-            + '图片以平台原生图片块显示。这里的接口与对话模型完全独立 —— 你可以在 DeepSeek 上聊天、在别处画图。'),
+            '把外部生图服务接成平台工具。模型在对话里调用 generate_image 生成新图、'
+            + '调用 image_edit 改已有图（含局部重绘）；图片直接显示在对话里，可点开全屏、下载、在工作区打开。'
+            + '这里的接口与对话模型完全独立 —— 你可以在 DeepSeek 上聊天、在别处画图。'),
         ),
 
         h(Card, { title: '状态', tone: ready ? undefined : 'warn' },
@@ -421,6 +739,16 @@ window.__ModuleLoader__.load({
                   }),
                 )
               : null,
+            h(Row, {
+              label: '改图模型',
+              hint: '留空则沿用上面的生图模型。改图走 /images/edits，有些服务商生图与改图是两个模型名',
+            },
+              h(Input, {
+                value: config.editModel,
+                onChange: value => set('editModel', value),
+                placeholder: '留空：沿用生图模型',
+              }),
+            ),
           ),
         ),
 
@@ -430,6 +758,16 @@ window.__ModuleLoader__.load({
               value: config.size,
               onChange: value => set('size', value),
               options: sizeOptionsFor(config.size),
+            }),
+          ),
+          h(Row, {
+            label: '改图尺寸',
+            hint: '留空则沿用上面的尺寸；两处都留空就完全不带 size，由上游按原图尺寸处理（改图通常希望这样）',
+          },
+            h(Select, {
+              value: config.editSize,
+              onChange: value => set('editSize', value),
+              options: sizeOptionsFor(config.editSize),
             }),
           ),
           h(Row, { label: '张数' },
@@ -454,8 +792,8 @@ window.__ModuleLoader__.load({
 
         h(Card, {
           title: '调用前确认',
-          subtitle: '开启后，模型每次想画图都会先弹窗问你一次 —— 生图是真实计费的，'
-            + '不希望你不在场时被刷。关掉则直接生成。',
+          subtitle: '开启后，模型每次想画图或改图都会先弹窗问你一次 —— 两者都真实计费，'
+            + '不希望你不在场时被刷。改图的确认框里会写明改的是哪张图。',
         },
           h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', color: T.text } },
             h('input', {
@@ -464,6 +802,14 @@ window.__ModuleLoader__.load({
               onChange: event => set('confirmBeforeGenerate', event.target.checked),
             }),
             '每次生图前向我确认',
+          ),
+          h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', color: T.text, marginTop: 8 } },
+            h('input', {
+              type: 'checkbox',
+              checked: config.confirmBeforeEdit !== false,
+              onChange: event => set('confirmBeforeEdit', event.target.checked),
+            }),
+            '每次改图前向我确认（确认框里会写明改的是哪张图）',
           ),
         ),
 
@@ -514,6 +860,7 @@ window.__ModuleLoader__.load({
             'GET  /api/image-tool/config      → 当前配置（已剔除 apiKey）',
             'POST /api/image-tool/config      → 写入配置（{ apiUrl, apiKey, model, ... }）',
             'POST /api/image-tool/generate    → 生图；加 ?includeData=1 直接拿 base64',
+            'POST /api/image-tool/edit        → 改图；body 需带 cwd（路径边界）与 image/prompt',
           ].join('\n')),
         ),
 
@@ -527,6 +874,24 @@ window.__ModuleLoader__.load({
     // ── 装配 ──────────────────────────────────────────────────────────────────
 
     function apply(ctx) {
+      // ── 工具卡片 ────────────────────────────────────────────────────────────
+      // 每个工具名一条独立注册：
+      //   · `key` 必须逐字等于 host 半注册的工具名，写错就是"永远不渲染"，没有任何提示；
+      //   · `priority: -1` —— keyed 槽位同 key 同优先级会抛错（热重载时旧注册还在的
+      //     那一瞬间就会撞上），压低优先级让它始终是一个"可替换的补位"；
+      //   · 外层 try/catch：这条失败不该连设置页一起没有，工具本身更不该受影响。
+      try {
+        for (const key of IMAGE_TOOL_KEYS) {
+          ctx.slots.inject('tool.call.toolview', () => ctx.slots.register({
+            name: 'tool.call.toolview',
+            key,
+            priority: -1,
+          }, ImageResultRow))
+        }
+      } catch (error) {
+        console.warn('[dsh-image-tool] 工具图片卡注册失败（工具与设置页不受影响）：', error)
+      }
+
       // `inject` 先声明依赖，再 register：这样槽位在 settings 页就绪后才挂上，
       // 也保证卸载时注册被成对回收。
       ctx.slots.inject('settings.section', () => ctx.slots.register({

@@ -1,7 +1,7 @@
 {
   "name": "dsh-image-tool",
-  "version": "0.1.0",
-  "description": "DeepSeek Harness 生图工具插件：把任意 OpenAI 兼容的生图服务接成平台工具，模型在对话里直接生图，图片以平台原生 image 块输出。生图 API 与对话模型 API 完全独立，可配置调用前确认。",
+  "version": "0.2.0",
+  "description": "DeepSeek Harness 生图与改图工具插件：把任意 OpenAI 兼容的生图/改图服务接成平台工具，模型在对话里直接生成或修改图片，图片以平台原生 image 块输出并显示在工具卡里（缩略图 / 全屏 / 下载 / 在工作区打开）。生图 API 与对话模型 API 完全独立，可配置调用前确认。",
   "type": "module",
   "main": "./lib/index.js",
   "exports": {
@@ -21,7 +21,10 @@
     "dsh-plugin",
     "deepseek-harness",
     "image-generation",
+    "image-editing",
     "text-to-image",
+    "image-to-image",
+    "inpainting",
     "tool"
   ],
   "license": "MIT",
@@ -29,8 +32,9 @@
     "node": "^22.19.0 || >=24.0.0"
   },
   "scripts": {
-    "test": "node scripts/test-generate.mjs && node scripts/test-plugin.mjs && node scripts/test-client.mjs && node scripts/test-save.mjs",
+    "test": "node scripts/test-generate.mjs && node scripts/test-image-source.mjs && node scripts/test-plugin.mjs && node scripts/test-client.mjs && node scripts/test-save.mjs",
     "test:generate": "node scripts/test-generate.mjs",
+    "test:image-source": "node scripts/test-image-source.mjs",
     "test:plugin": "node scripts/test-plugin.mjs",
     "test:client": "node scripts/test-client.mjs",
     "mock:api": "node scripts/mock-image-api.mjs",

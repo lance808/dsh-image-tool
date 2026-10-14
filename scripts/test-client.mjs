@@ -41,6 +41,39 @@ function makeReactStub() {
     useState: (initial) => [typeof initial === 'function' ? initial() : initial, () => {}],
     useEffect: () => {},
     useCallback: (fn) => fn,
+    useMemo: (fn) => fn(),
+    useRef: (initial) => ({ current: initial }),
+  };
+}
+
+/**
+ * 造一个 client 半的 ctx 假体：分开记录 toolview 与设置页两种注册。
+ *
+ * 必须按 `name` 区分，不能"谁最后注册谁就是设置页" —— 那个顺序是实现的巧合，
+ * 加一条注册就会把断言指到别的组件上，而测试仍然"通过"。
+ */
+function makeSlotsCtx() {
+  const registrations = [];
+  const injected = [];
+  const ctx = {
+    slots: {
+      inject: (key, callback) => {
+        injected.push(key);
+        callback();
+        return () => {};
+      },
+      register: (registration, component) => {
+        registrations.push({ registration, component });
+        return () => {};
+      },
+    },
+  };
+  return {
+    ctx,
+    registrations,
+    injected,
+    toolviews: () => registrations.filter((item) => item.registration.name === 'tool.call.toolview'),
+    settings: () => registrations.filter((item) => item.registration.name === 'settings.section'),
   };
 }
 
@@ -63,33 +96,37 @@ async function loadClientModule() {
 
 const definition = await loadClientModule();
 
-await test('ModuleLoader 定义：带 id，factory 只 require("react")', () => {
+await test('ModuleLoader 定义：带 id，只 require 外壳提供的 react / react-dom', () => {
   assert.equal(definition.id, 'dsh-image-tool');
   const required = [];
   const exports = definition.factory((name) => { required.push(name); return makeReactStub(); });
-  assert.deepEqual(required, ['react'], `只应 require react，实际 ${required.join(', ')}`);
+  assert.deepEqual(required, ['react', 'react-dom'], `只应 require react 与 react-dom，实际 ${required.join(', ')}`);
   assert.ok(exports, 'factory 必须返回模块导出');
   assert.equal(typeof exports.apply, 'function');
   assert.deepEqual(exports.inject, ['slots'], '只应依赖 slots 服务');
   assert.equal(exports.name, 'dsh-image-tool');
 });
 
+await test('拿不到 react-dom 时照样能加载（退回就地渲染，而不是整块崩掉）', () => {
+  const required = [];
+  const exports = definition.factory((name) => {
+    required.push(name);
+    if (name === 'react-dom') throw new Error('module not found');
+    return makeReactStub();
+  });
+  assert.ok(exports, 'react-dom 缺失不应让整个模块加载失败');
+  const slots = makeSlotsCtx();
+  assert.doesNotThrow(() => exports.apply(slots.ctx), 'apply 不应因缺少 react-dom 而抛错');
+  assert.equal(slots.toolviews().length, 2, '图片卡仍然要注册');
+});
+
 await test('apply 把设置页注册到 settings.section，且 id/label 正确', () => {
-  const registrations = [];
-  const React = makeReactStub();
-  const exports = definition.factory(() => React);
-  const ctx = {
-    slots: {
-      inject: (key, callback) => { assert.equal(key, 'settings.section'); callback(); return () => {}; },
-      register: (registration, component) => {
-        registrations.push({ registration, component });
-        return () => {};
-      },
-    },
-  };
-  exports.apply(ctx);
-  assert.equal(registrations.length, 1, '应恰好注册一个设置分区');
-  const { registration, component } = registrations[0];
+  const exports = definition.factory(() => makeReactStub());
+  const slots = makeSlotsCtx();
+  exports.apply(slots.ctx);
+  const settings = slots.settings();
+  assert.equal(settings.length, 1, '应恰好注册一个设置分区');
+  const { registration, component } = settings[0];
   assert.equal(registration.name, 'settings.section');
   assert.equal(registration.id, 'image-tool', 'id 必须是 image-tool（与命名空间一致，便于定位）');
   assert.equal(typeof registration.order, 'number');
@@ -97,16 +134,31 @@ await test('apply 把设置页注册到 settings.section，且 id/label 正确',
   assert.equal(typeof component, 'function', '第二个参数必须是组件');
 });
 
+await test('apply 为生图与改图两个工具各注册一张工具卡（key 必须等于工具名）', () => {
+  const exports = definition.factory(() => makeReactStub());
+  const slots = makeSlotsCtx();
+  exports.apply(slots.ctx);
+
+  const views = slots.toolviews();
+  assert.deepEqual(
+    views.map((item) => item.registration.key).sort(),
+    ['generate_image', 'image_edit'],
+    'key 必须逐字等于 host 半注册的工具名，写错就是"永远不渲染"且没有任何提示',
+  );
+  for (const view of views) {
+    assert.equal(view.registration.priority, -1, 'keyed 槽位同 key 同优先级会抛错，必须压低优先级');
+    assert.equal(typeof view.component, 'function');
+    // 声明 tool.call.images 子槽会让整条注册失败：内置 read_image 已经声明了它，
+    // 而"一个子槽只能由一个 entry 声明"。这条断言就是防止有人"顺手加上"。
+    assert.equal(view.registration.children, undefined, '不得声明 tool.call.images 子槽');
+  }
+});
+
 await test('组件首次渲染不抛错（读配置前显示占位，而不是崩掉）', () => {
-  const React = makeReactStub();
-  const exports = definition.factory(() => React);
-  let component = null;
-  exports.apply({
-    slots: {
-      inject: (_key, callback) => { callback(); return () => {}; },
-      register: (_registration, comp) => { component = comp; return () => {}; },
-    },
-  });
+  const exports = definition.factory(() => makeReactStub());
+  const slots = makeSlotsCtx();
+  exports.apply(slots.ctx);
+  const component = slots.settings()[0]?.component;
   assert.ok(component);
   // 注意渲染语义：注册进来的是**包装函数**（外壳会把它当函数组件调用），
   // 它返回一个 element；真正要渲染的是那个 element 的 type。
@@ -147,16 +199,28 @@ await test('前端绝不持有密钥：不读 apiKey 字段，只读 hasKey/keyH
  *
  * 之所以要"自动补齐"而不是写死数组长度：组件每加一个 useState，固定长度的数组就会
  * **静默错位** —— 多出来的格子读到 undefined，测试要么崩，要么更糟：放过一个真 bug。
+ *
+ * `unit` 是**按组件分桶**的渲染单元：一次测试里先后渲染两个组件（工具卡 + 它内部的
+ * 缩略图）时，共用一个游标会让第二个组件读到第一个组件的格子，断言看似通过其实测的是
+ * 别的东西。默认桶仍叫 default，老的调用方式不受影响。
  */
 function makeStatefulReact(initialByIndex = {}) {
-  const cells = new Map();
+  const buckets = new Map();
+  let unit = 'default';
   let cursor = 0;
+  const bucketOf = (name) => {
+    if (!buckets.has(name)) buckets.set(name, new Map());
+    return buckets.get(name);
+  };
   const React = {
     ...makeReactStub(),
     useState: (initial) => {
       const index = cursor++;
+      const cells = bucketOf(unit);
       if (!cells.has(index)) {
-        cells.set(index, index in initialByIndex ? initialByIndex[index] : (typeof initial === 'function' ? initial() : initial));
+        cells.set(index, unit === 'default' && index in initialByIndex
+          ? initialByIndex[index]
+          : (typeof initial === 'function' ? initial() : initial));
       }
       return [cells.get(index), (next) => {
         cells.set(index, typeof next === 'function' ? next(cells.get(index)) : next);
@@ -165,9 +229,9 @@ function makeStatefulReact(initialByIndex = {}) {
   };
   return {
     React,
-    cell: (index) => cells.get(index),
+    cell: (index, name = 'default') => bucketOf(name).get(index),
     /** 每轮渲染前调用：hook 的调用顺序在每一轮里都从 0 重新开始。 */
-    beginRender: () => { cursor = 0; },
+    beginRender: (name = 'default') => { unit = name; cursor = 0; },
   };
 }
 
@@ -180,13 +244,51 @@ function flatten(tree) {
 /** 装配设置页并返回一个"渲染一次"的函数，拿到的是摊平后的 element 列表。 */
 function mountClient(initialByIndex) {
   const state = makeStatefulReact(initialByIndex);
-  let component;
-  definition.factory(() => state.React).apply({ slots: {
-    inject: (_key, cb) => cb(), register: (_registration, comp) => { component = comp; },
-  } });
+  const slots = makeSlotsCtx();
+  // 用带状态的 React：设置页有 useState。
+  definition.factory(() => state.React).apply(slots.ctx);
+  const component = slots.settings()[0]?.component;
+  assert.ok(component, '必须注册出设置页组件');
   return {
     state,
     render: () => { state.beginRender(); return flatten(component().type()); },
+  };
+}
+
+/**
+ * 装配工具卡并渲染一次。
+ *
+ * `loadImage` 是 owner props 提供的**会话授权加载器**：这里给一个带 `peek` 的桩，
+ * 因为组件的初始 URL 就来自 `peek`（`useEffect` 在桩里不执行，避免测试变成
+ * "验证 promise 时序"而不是"验证卡片渲染了什么"）。
+ */
+function mountToolview(toolName, props = {}) {
+  const state = makeStatefulReact();
+  const slots = makeSlotsCtx();
+  definition.factory(() => state.React).apply(slots.ctx);
+  const view = slots.toolviews().find((item) => item.registration.key === toolName);
+  assert.ok(view, `必须注册 ${toolName} 的工具卡`);
+  const ownerProps = {
+    toolName,
+    callId: 'call-1',
+    phase: 'result',
+    cwd: 'D:\\work',
+    openFile: () => {},
+    loadImage: Object.assign(async () => 'blob:fake-url', { peek: () => 'blob:fake-url' }),
+    ...props,
+  };
+  return {
+    state,
+    /** 渲染工具卡本体。 */
+    row: (next = {}) => {
+      state.beginRender('row');
+      return view.component({ ...ownerProps, ...next });
+    },
+    /** 单独渲染卡片内部的一个子组件（createElement 桩不会执行它们）。 */
+    child: (element, unit = 'child') => {
+      state.beginRender(unit);
+      return element.type(element.props);
+    },
   };
 }
 
@@ -343,6 +445,90 @@ await test('尺寸下拉：空值与预设值都不触发补项', () => {
     const select = render().find(n => Array.isArray(n.props?.options) && n.props.options.some(o => Array.isArray(o.options)));
     assert.equal(select.props.options.some(o => String(o.label).includes('当前值')), false, `size=${JSON.stringify(size)} 不该补项`);
   }
+});
+
+// ── 工具卡（内联生图块）──────────────────────────────────────────────────────
+//
+// 这一组测的是"用户到底看没看到图"：平台内置的图片卡只认 `read_image` 这一个工具名，
+// 不注册我们自己的卡片，通用卡片会把 image 块 `JSON.stringify` 之后显示 ——
+// 也就是说这个功能坏掉时的症状是"对话里出现一坨附件引用 JSON"，与"没报错"极像。
+
+const FIXTURE_REF = { attachmentId: 'att-1', mediaType: 'image/png', bytes: 2048, width: 1024, height: 1024, name: 'generated-123-1.png' };
+const FIXTURE_PATH = 'D:\\work\\generated-images\\generated-123-1.png';
+
+function resultBlock() {
+  return {
+    kind: 'result',
+    isError: false,
+    content: [
+      { type: 'text', text: '已生成 1 张图片（模型 gpt-image-1）。\n已保存到：' + FIXTURE_PATH },
+      { type: 'image', attachment: FIXTURE_REF },
+    ],
+    meta: {
+      images: [{ attachmentId: 'att-1', mediaType: 'image/png', width: 1024, height: 1024, diskPath: FIXTURE_PATH }],
+    },
+  };
+}
+
+await test('工具卡：把结果里的 image 块画成真图，并给出下载与在工作区打开', () => {
+  const view = mountToolview('generate_image');
+  const nodes = flatten(view.row({ block: resultBlock() }));
+  // 缩略图是子组件：createElement 桩不会执行它，要单独渲染一次才看得到 <img>。
+  const thumb = nodes.find(n => typeof n.type === 'function' && n.props?.attachment);
+  assert.ok(thumb, '结果里有 image 块时，必须为每张图渲染一个缩略图');
+  const thumbNodes = flatten(view.child(thumb));
+
+  const img = thumbNodes.find(n => n.type === 'img');
+  assert.ok(img, '必须渲染真正的 <img> —— 这才是"内联图片卡"');
+  assert.equal(img.props.src, 'blob:fake-url', '图片 URL 只能来自 owner props 的 loadImage（会话授权）');
+  assert.ok(thumbNodes.some(n => n.type === 'a' && n.props.download === FIXTURE_REF.name), '每张图应有下载入口');
+  const open = thumbNodes.find(n => n.type === 'button' && typeof n.props?.title === 'string' && n.props.title.startsWith('./'));
+  assert.ok(open, '落盘过的图应能一键在工作区打开，且用相对路径');
+  assert.ok(JSON.stringify(nodes).includes('已生成 1 张图片'), '文本说明要保留在卡片里');
+});
+
+await test('工具卡：文本区绝不出现附件引用 JSON', () => {
+  const view = mountToolview('generate_image');
+  const nodes = flatten(view.row({ block: resultBlock() }));
+  const pre = nodes.find(n => n.type === 'pre');
+  const text = JSON.stringify(pre ?? {});
+  assert.ok(!text.includes('attachmentId'), '文本区出现附件引用 JSON，正是"没有图片卡"时的症状');
+  assert.match(text, /generated-123-1\.png/, '应当显示可读的保存路径');
+});
+
+await test('工具卡：进行中不显示图片，而是给出等待时间', () => {
+  const view = mountToolview('image_edit');
+  const nodes = flatten(view.row({
+    phase: 'start',
+    block: { phase: 'start', name: 'image_edit', callId: 'call-1', argsRaw: '{}' },
+  }));
+  const text = JSON.stringify(nodes);
+  assert.match(text, /正在改图/, '进行中要说明在做什么');
+  assert.match(text, /已等待/, '同步接口几十秒很正常，必须让用户看到还在跑');
+  assert.ok(!nodes.some(n => n.type === 'img'), '还没有结果时不该出现图片');
+});
+
+await test('工具卡：改图时显示原图来源', () => {
+  const view = mountToolview('image_edit');
+  const block = resultBlock();
+  block.content[0] = { type: 'text', text: '已改图 1 张图片（模型 gpt-image-1）。' };
+  block.meta.origin = '会话里最近一张图片 att-9';
+  const text = JSON.stringify(flatten(view.row({ block })));
+  assert.match(text, /会话里最近一张图片 att-9/, '用户必须能核对模型改的是不是他以为的那张图');
+});
+
+await test('工具卡：失败时渲染错误态，而不是假装成功', () => {
+  const view = mountToolview('generate_image');
+  const nodes = flatten(view.row({
+    block: { kind: 'result', isError: true, content: [{ type: 'text', text: '生图失败：连不上上游' }] },
+  }));
+  const text = JSON.stringify(nodes);
+  assert.match(text, /失败/);
+  assert.ok(
+    nodes.some(n => n.props?.style?.color === 'var(--dsw-alias-state-error-primary)'),
+    '失败态要用错误色，而不是和成功长得一样',
+  );
+  assert.ok(!nodes.some(n => n.type === 'img'), '失败时不该出现图片');
 });
 
 console.log(failures ? `\n${failures} 个用例失败` : '\n全部通过');

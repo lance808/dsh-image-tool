@@ -9,10 +9,15 @@ import assert from 'node:assert/strict';
 import {
   ImageToolError,
   assertFetchableImageUrl,
+  buildEditFormData,
+  buildEditPayload,
   buildRequestPayload,
   callImageApi,
+  callImageEditApi,
   clampCount,
   decodeImages,
+  editImages,
+  editsEndpoint,
   generationsEndpoint,
   generateImages,
   isPrivateHost,
@@ -225,6 +230,134 @@ await test('generateImages：端到端（假上游 + 假附件），并把附件
   assert.match(saved[0].name, /\.png$/);
   assert.match(saved[1].name, /\.jpg$/);
   assert.equal(result.images[0].ref.attachmentId, 'att-1');
+});
+
+// ── 改图（/images/edits，multipart） ─────────────────────────────────────────
+
+await test('editsEndpoint：生图端点会被退回，不会拼出 /images/generations/images/edits', () => {
+  assert.equal(editsEndpoint('https://x.example.com/v1'), 'https://x.example.com/v1/images/edits');
+  assert.equal(editsEndpoint('https://x.example.com/v1/images/generations'), 'https://x.example.com/v1/images/edits');
+  assert.equal(editsEndpoint('https://x.example.com/v1/images/edits'), 'https://x.example.com/v1/images/edits');
+  assert.equal(editsEndpoint('http://127.0.0.1:7860/v1/'), 'http://127.0.0.1:7860/v1/images/edits');
+  assert.throws(() => editsEndpoint(''), /未配置生图接口地址/);
+});
+
+await test('buildEditPayload：必须同时有 prompt 与原图', () => {
+  const config = { editModel: 'edit-m', editSize: '512x512' };
+  assert.throws(() => buildEditPayload(config, { prompt: '  ' }, { image: { buffer: PNG, mediaType: 'image/png' } }), /prompt 不能为空/);
+  assert.throws(() => buildEditPayload(config, { prompt: '改成夜景' }, {}), /缺少原图/);
+  assert.throws(() => buildEditPayload(config, { prompt: '改成夜景' }, { image: { buffer: Buffer.alloc(0), mediaType: 'image/png' } }), /缺少原图/);
+});
+
+await test('buildEditPayload：改图模型/尺寸优先，缺省回退生图的那两个', () => {
+  const image = { buffer: PNG, mediaType: 'image/png', name: 'in.png' };
+  const withEdit = buildEditPayload({ model: 'gen-m', editModel: 'edit-m', size: '1024x1024', editSize: '512x512' }, { prompt: 'x' }, { image });
+  assert.equal(withEdit.fields.model, 'edit-m');
+  assert.equal(withEdit.fields.size, '512x512');
+  assert.equal(withEdit.fields.response_format, 'b64_json', '显式要 base64，省掉一次下载与 SSRF 判定');
+  assert.equal(withEdit.fields.n, '1');
+
+  const fallback = buildEditPayload({ model: 'gen-m', size: '1024x1024' }, { prompt: 'x' }, { image });
+  assert.equal(fallback.fields.model, 'gen-m', '没配改图模型时沿用生图模型');
+  assert.equal(fallback.fields.size, '1024x1024');
+
+  // 两处尺寸都没配 → **不发 size**，让上游按原图尺寸处理（显式给尺寸常导致重绘/裁切）
+  const noSize = buildEditPayload({ model: '' }, { prompt: 'x' }, { image });
+  assert.equal('size' in noSize.fields, false);
+  assert.equal('model' in noSize.fields, false, '模型留空就不发 model 字段，由上游默认');
+
+  // 参数优先于配置
+  const explicit = buildEditPayload({ editModel: 'a', editSize: '1x1' }, { prompt: 'x', model: 'b', size: '2x2', count: 3 }, { image });
+  assert.equal(explicit.fields.model, 'b');
+  assert.equal(explicit.fields.size, '2x2');
+  assert.equal(explicit.fields.n, '3');
+});
+
+await test('buildEditFormData：字段进表单、原图与 mask 是二进制字段', () => {
+  const payload = buildEditPayload({ editModel: 'm' }, { prompt: '改成夜景' }, {
+    image: { buffer: PNG, mediaType: 'image/png', name: 'in.png' },
+    mask: { buffer: PNG, mediaType: 'image/png', name: 'mask.png' },
+  });
+  const form = buildEditFormData(payload);
+  assert.ok(form instanceof FormData, '改图必须走 multipart');
+  assert.equal(form.get('prompt'), '改成夜景');
+  assert.equal(form.get('model'), 'm');
+  const image = form.get('image');
+  assert.ok(image instanceof Blob, '原图必须是二进制字段');
+  assert.equal(image.type, 'image/png');
+  assert.equal(image.size, PNG.byteLength);
+  assert.equal(form.get('mask').size, PNG.byteLength);
+
+  // 不给 mask 时，表单里不该出现这个字段（空字段会让部分上游直接 400）
+  const noMask = buildEditFormData(buildEditPayload({}, { prompt: 'x' }, { image: { buffer: JPEG, mediaType: 'image/jpeg' } }));
+  assert.equal(noMask.get('mask'), null);
+  assert.equal(noMask.get('image').name, 'image.jpg', '没给文件名时按媒体类型补一个');
+});
+
+await test('callImageEditApi：POST multipart，且**绝不**手写 content-type', async () => {
+  let seen = null;
+  const payload = buildEditPayload({}, { prompt: '改成夜景' }, { image: { buffer: PNG, mediaType: 'image/png', name: 'in.png' } });
+  const body = await callImageEditApi({
+    config: { apiUrl: 'https://x.example.com/v1', apiKey: 'k' },
+    payload,
+    fetchImpl: async (url, init) => {
+      seen = { url, init };
+      return new Response(JSON.stringify({ data: [{ b64_json: PNG.toString('base64') }] }), { status: 200 });
+    },
+  });
+  assert.equal(seen.url, 'https://x.example.com/v1/images/edits');
+  assert.equal(seen.init.method, 'POST');
+  assert.equal(seen.init.headers.authorization, 'Bearer k');
+  // 这条是真实的坑：自己写 content-type 而 boundary 由 fetch 生成，两者对不上，
+  // 上游会以"解析不出表单"报错，现象与"参数没传"几乎一样，很难反推。
+  assert.equal(seen.init.headers['content-type'], undefined, 'content-type 必须交给 fetch 自己带 boundary');
+  assert.ok(seen.init.body instanceof FormData);
+  assert.equal(body.data.length, 1);
+});
+
+await test('callImageEditApi：缺 Key / HTTP 错误 / 非法 JSON 都是可读错误', async () => {
+  const payload = buildEditPayload({}, { prompt: 'x' }, { image: { buffer: PNG, mediaType: 'image/png' } });
+  await assert.rejects(
+    () => callImageEditApi({ config: { apiUrl: 'https://x/v1', apiKey: '' }, payload, fetchImpl: async () => { throw new Error('不该发出请求'); } }),
+    /未配置生图 API Key/,
+  );
+  await assert.rejects(
+    () => callImageEditApi({
+      config: { apiUrl: 'https://x/v1', apiKey: 'k' }, payload,
+      fetchImpl: async () => new Response('nope', { status: 502 }),
+    }),
+    /改图接口返回 HTTP 502/,
+  );
+  await assert.rejects(
+    () => callImageEditApi({
+      config: { apiUrl: 'https://x/v1', apiKey: 'k' }, payload,
+      fetchImpl: async () => new Response('<html>', { status: 200 }),
+    }),
+    /不是合法 JSON/,
+  );
+});
+
+await test('editImages：端到端产出附件，文件名带 edited- 前缀与正确扩展名', async () => {
+  const saved = [];
+  const result = await editImages({
+    config: { apiUrl: 'https://x.example.com/v1', apiKey: 'k', editModel: 'edit-m' },
+    args: { prompt: '把背景换成夜晚' },
+    source: { image: { buffer: PNG, mediaType: 'image/png', name: 'in.png' } },
+    fetchImpl: async (url, init) => {
+      assert.equal(url, 'https://x.example.com/v1/images/edits');
+      assert.equal(init.body.get('prompt'), '把背景换成夜晚');
+      assert.equal(init.body.get('model'), 'edit-m');
+      return new Response(JSON.stringify({ data: [{ b64_json: JPEG.toString('base64') }] }), { status: 200 });
+    },
+    saveImage: async (input) => {
+      saved.push(input);
+      return { attachmentId: `att-${saved.length}`, mediaType: input.mediaType, bytes: input.data.byteLength, width: 1, height: 1, name: input.name };
+    },
+  });
+  assert.equal(result.images.length, 1);
+  assert.equal(saved[0].mediaType, 'image/jpeg', '媒体类型按真实字节嗅探');
+  assert.match(saved[0].name, /^edited-\d+-1\.jpg$/, '改图产物与生图产物在附件库里要能一眼区分');
+  assert.equal(result.payload.fields.prompt, '把背景换成夜晚');
 });
 
 // ── 上游模型列表（设置页的「识别上游模型」） ─────────────────────────────────
